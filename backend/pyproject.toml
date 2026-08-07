@@ -43,3 +43,8 @@ ignore = ["E501"]  # Line too long (handled by formatter)
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
