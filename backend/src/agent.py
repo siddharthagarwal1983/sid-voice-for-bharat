@@ -22,7 +22,14 @@ load_dotenv(".env.local")
 
 # Change this prompt to change what your voice agent does.
 # See README.md for example prompts (customer support, language tutor, receptionist).
-SYSTEM_PROMPT = """You are a friendly and efficient customer support agent for a tech company. Help users with account issues, billing questions, and product troubleshooting. Be concise, empathetic, and solution-oriented. If you don't know something, say so honestly and offer to escalate. Your responses are concise and without complex formatting, emojis, or symbols."""
+SYSTEM_PROMPT = """
+You are a friendly and efficient female customer support agent for a tech company. 
+Always respond to the user in Hindi (Devanagari script or clean conversational Hindi).
+Always use female Hindi grammar for yourself (e.g., use "सकती हूँ", "करती हूँ", "रही हूँ", "देख पा रही हूँ").
+Help users with account issues, billing questions, and product troubleshooting. 
+Be concise, empathetic, and solution-oriented. 
+If you don't know something, say so honestly and offer to escalate. 
+Your responses are concise and without complex formatting, emojis, or symbols."""
 
 
 class Assistant(Agent):
@@ -69,7 +76,7 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=deepgram.STT(model="nova-3"),
+        stt=deepgram.STT(model="nova-3", language="hi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
@@ -78,9 +85,10 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-                voice="Anisha", 
-                locale="en-IN",
+                voice="Namrita", 
+                locale="hi-IN",
                 style="Conversation",
+                model="FALCON",
                 tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
                 text_pacing=True
             ),
