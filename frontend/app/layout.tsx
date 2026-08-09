@@ -71,38 +71,44 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           enableSystem
           disableTransitionOnChange
         >
-          <header className="fixed top-0 left-0 z-50 hidden w-full flex-row justify-between p-6 md:flex">
+          <header className="fixed top-0 left-0 z-50 flex w-full flex-row items-center justify-between p-6">
             <a
               target="_blank"
               rel="noopener noreferrer"
-              href="https://livekit.io"
-              className="scale-100 transition-transform duration-300 hover:scale-110"
+              href="https://murf.ai"
+              className="flex items-center gap-2"
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={logo} alt={`${companyName} Logo`} className="block size-6 dark:hidden" />
+              <img
+                src={logo}
+                alt={`${companyName} Logo`}
+                className="block h-6 w-auto dark:hidden"
+              />
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={logoDark ?? logo}
                 alt={`${companyName} Logo`}
-                className="hidden size-6 dark:block"
+                className="hidden h-6 w-auto dark:block"
               />
+              <span className="text-foreground text-sm font-semibold">{companyName}</span>
             </a>
-            <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase">
-              Built with{' '}
+
+            <span className="text-muted-foreground font-mono text-xs font-medium tracking-wide">
+              Powered by{' '}
               <a
                 target="_blank"
                 rel="noopener noreferrer"
                 href="https://docs.livekit.io/agents"
-                className="underline underline-offset-4"
+                className="text-foreground underline underline-offset-4"
               >
-                LiveKit Agents
+                LiveKit
               </a>
             </span>
           </header>
 
           {children}
-          <div className="group fixed bottom-0 left-1/2 z-50 mb-2 -translate-x-1/2">
-            <ThemeToggle className="translate-y-20 transition-transform delay-150 duration-300 group-hover:translate-y-0" />
+          <div className="fixed right-6 bottom-5 z-50">
+            <ThemeToggle />
           </div>
         </ThemeProvider>
       </body>

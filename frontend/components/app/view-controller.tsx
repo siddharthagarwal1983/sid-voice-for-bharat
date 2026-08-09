@@ -1,77 +1,68 @@
 'use client';
 
-import { useTheme } from 'next-themes';
-import { AnimatePresence, motion } from 'motion/react';
-import { useSessionContext } from '@livekit/components-react';
+import { useEffect, useRef, useState } from 'react';
+import { MediaDeviceFailure, RoomEvent } from 'livekit-client';
+import { useAgent, useSessionContext } from '@livekit/components-react';
 import type { AppConfig } from '@/app-config';
-import { AgentSessionView_01 } from '@/components/agents-ui/blocks/agent-session-view-01';
-import { WelcomeView } from '@/components/app/welcome-view';
-
-const MotionWelcomeView = motion.create(WelcomeView);
-const MotionSessionView = motion.create(AgentSessionView_01);
-
-const VIEW_MOTION_PROPS = {
-  variants: {
-    visible: {
-      opacity: 1,
-    },
-    hidden: {
-      opacity: 0,
-    },
-  },
-  initial: 'hidden',
-  animate: 'visible',
-  exit: 'hidden',
-  transition: {
-    duration: 0.5,
-    ease: 'linear',
-  },
-};
+import { AgentStateView, deriveUiPhase } from '@/components/app/agent-state-view';
 
 interface ViewControllerProps {
   appConfig: AppConfig;
 }
 
 export function ViewController({ appConfig }: ViewControllerProps) {
-  const { isConnected, start } = useSessionContext();
-  const { resolvedTheme } = useTheme();
+  const { isConnected, start, end, room } = useSessionContext();
+  const { state: agentState } = useAgent();
+
+  // Track whether we were ever connected so we can show the "ended" state
+  const wasConnected = useRef(false);
+  const [showEnded, setShowEnded] = useState(false);
+  const [micBlocked, setMicBlocked] = useState(false);
+
+  useEffect(() => {
+    if (isConnected) {
+      wasConnected.current = true;
+      setShowEnded(false);
+    } else if (wasConnected.current) {
+      setShowEnded(true);
+    }
+  }, [isConnected]);
+
+  // Detect when the browser blocks microphone access so we can explain why
+  // the call can't start instead of failing silently.
+  useEffect(() => {
+    const onMediaDevicesError = (error: Error, kind?: MediaDeviceKind) => {
+      if (kind && kind !== 'audioinput') return;
+      if (MediaDeviceFailure.getFailure(error) !== MediaDeviceFailure.PermissionDenied) return;
+
+      setMicBlocked(true);
+      end();
+    };
+
+    room.on(RoomEvent.MediaDevicesError, onMediaDevicesError);
+    return () => {
+      room.off(RoomEvent.MediaDevicesError, onMediaDevicesError);
+    };
+  }, [room, end]);
+
+  const phase = micBlocked
+    ? 'blocked'
+    : deriveUiPhase(isConnected, agentState as Parameters<typeof deriveUiPhase>[1], showEnded);
+
+  const handleStart = () => {
+    setShowEnded(false);
+    setMicBlocked(false);
+    wasConnected.current = false;
+    start();
+  };
 
   return (
-    <AnimatePresence mode="wait">
-      {/* Welcome view */}
-      {!isConnected && (
-        <MotionWelcomeView
-          key="welcome"
-          {...VIEW_MOTION_PROPS}
-          startButtonText={appConfig.startButtonText}
-          onStartCall={start}
-        />
-      )}
-      {/* Session view */}
-      {isConnected && (
-        <MotionSessionView
-          key="session-view"
-          {...VIEW_MOTION_PROPS}
-          supportsChatInput={appConfig.supportsChatInput}
-          supportsVideoInput={appConfig.supportsVideoInput}
-          supportsScreenShare={appConfig.supportsScreenShare}
-          isPreConnectBufferEnabled={appConfig.isPreConnectBufferEnabled}
-          audioVisualizerType={appConfig.audioVisualizerType}
-          audioVisualizerColor={
-            resolvedTheme === 'dark'
-              ? appConfig.audioVisualizerColorDark
-              : appConfig.audioVisualizerColor
-          }
-          audioVisualizerColorShift={appConfig.audioVisualizerColorShift}
-          audioVisualizerBarCount={appConfig.audioVisualizerBarCount}
-          audioVisualizerGridRowCount={appConfig.audioVisualizerGridRowCount}
-          audioVisualizerGridColumnCount={appConfig.audioVisualizerGridColumnCount}
-          audioVisualizerRadialBarCount={appConfig.audioVisualizerRadialBarCount}
-          audioVisualizerRadialRadius={appConfig.audioVisualizerRadialRadius}
-          audioVisualizerWaveLineWidth={appConfig.audioVisualizerWaveLineWidth}
-          className="fixed inset-0"
-        />
-      )}
-    </AnimatePresence>
+    <AgentStateView
+      phase={phase}
+      isConnected={isConnected}
+      onStart={handleStart}
+      onEnd={end}
+      startButtonText={appConfig.startButtonText}
+    />
   );
 }
