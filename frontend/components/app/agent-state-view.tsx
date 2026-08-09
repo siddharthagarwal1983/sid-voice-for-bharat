@@ -3,7 +3,8 @@
 import React from 'react';
 import { Loader2, Mic, MicOff, PhoneOff, Volume2 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { useLocalParticipant } from '@livekit/components-react';
+import { type ReceivedMessage, useLocalParticipant } from '@livekit/components-react';
+import { AgentChatTranscript } from '@/components/agents-ui/agent-chat-transcript';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/shadcn/utils';
 
@@ -149,6 +150,9 @@ export interface AgentStateViewProps {
   onStart: () => void;
   onEnd: () => void;
   startButtonText?: string;
+  /** Live transcript of both sides of the call, shown once there's something to show. */
+  messages?: ReceivedMessage[];
+  agentState?: AgentSdkState;
 }
 
 export function AgentStateView({
@@ -157,6 +161,8 @@ export function AgentStateView({
   onStart,
   onEnd,
   startButtonText = 'Start talking',
+  messages = [],
+  agentState,
 }: AgentStateViewProps) {
   const cfg = PHASE_CONFIG[phase];
 
@@ -273,6 +279,13 @@ export function AgentStateView({
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* ── Chat transcript — what's been spoken so far ── */}
+        {messages.length > 0 && (
+          <div className="border-border bg-card flex h-72 w-full flex-col overflow-hidden rounded-lg border">
+            <AgentChatTranscript agentState={agentState} messages={messages} className="flex-1" />
+          </div>
+        )}
       </section>
 
       {/* ── Footer ── */}

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { MediaDeviceFailure, RoomEvent } from 'livekit-client';
-import { useAgent, useSessionContext } from '@livekit/components-react';
+import { useAgent, useSessionContext, useSessionMessages } from '@livekit/components-react';
 import type { AppConfig } from '@/app-config';
 import { AgentStateView, deriveUiPhase } from '@/components/app/agent-state-view';
 
@@ -11,8 +11,10 @@ interface ViewControllerProps {
 }
 
 export function ViewController({ appConfig }: ViewControllerProps) {
-  const { isConnected, start, end, room } = useSessionContext();
+  const session = useSessionContext();
+  const { isConnected, start, end, room } = session;
   const { state: agentState } = useAgent();
+  const { messages } = useSessionMessages(session);
 
   // Track whether we were ever connected so we can show the "ended" state
   const wasConnected = useRef(false);
@@ -63,6 +65,8 @@ export function ViewController({ appConfig }: ViewControllerProps) {
       onStart={handleStart}
       onEnd={end}
       startButtonText={appConfig.startButtonText}
+      messages={messages}
+      agentState={agentState}
     />
   );
 }

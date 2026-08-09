@@ -11,6 +11,10 @@ KMS
 .pytest_cache
 .ruff_cache
 
+# SQLite call/transcript database (see src/db.py)
+data/
+*.db
+
 # Claude Code
 .claude/settings.local.json
 .claude/worktrees/
