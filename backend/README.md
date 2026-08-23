@@ -176,6 +176,46 @@ Default is Google Gemini. To switch:
 - **Gemini (default):** Set `GOOGLE_API_KEY` in `.env.local`
 - **OpenAI:** Set `OPENAI_API_KEY`, install `livekit-agents[openai]`, and change the `llm=` argument
 
+## Health Data Tools
+
+The default HealthMitra prompt (see `SYSTEM_PROMPT` in `agent.py`) gives the agent two domain-specific function tools it decides to call on its own, mid-conversation, without being asked. Both live in [`src/health_tools.py`](src/health_tools.py) and are wired up as `@function_tool` methods on `Assistant` in [`src/agent.py`](src/agent.py).
+
+### 1. `classify_symptom_triage` — LOCAL data, not live
+
+Routes a caller's described symptoms to `emergency` / `phc` / `home_care` using a **fixed, hand-built keyword ruleset** (`_TRIAGE_RULES` in `health_tools.py`), modeled on the same red-flag list already in the system prompt (chest pain, breathlessness, heavy bleeding, high fever, dehydration, etc.).
+
+This is intentionally **not** a live medical API — there isn't a reliable public one for this, and for a no-diagnosis assistant a fixed, inspectable ruleset is arguably the safer choice anyway: every routing decision traces back to one specific matched keyword, never to an ungrounded LLM guess. The tool result includes `ruleset_version` so it's clear which version of the rules produced the routing.
+
+The agent calls this as soon as a caller describes symptoms, before deciding how to route the call — see the `SYMPTOM TRIAGE` section of `SYSTEM_PROMPT`.
+
+### 2. `find_nearby_health_facility` — LIVE data, with a local fallback
+
+Looks up nearby government hospitals/PHCs for a district. It tries a **live** fetch against [OpenStreetMap's Nominatim](https://nominatim.org/) search API first (free, keyless, real public data — no API key needed). If that fails — timeout, rate limit, no network, all realistic on the connections these callers are on — it falls back to a **small hand-curated local list** (`_LOCAL_FALLBACK` in `health_tools.py`) of well-known government hospitals for about a dozen major Indian districts, and is explicit with the caller about which source it used ("fetched live just now" vs. "from a saved local reference list, which may not be fully up to date"). If neither source has anything for the caller's district, the agent says so plainly and points them to the 104 health helpline or their local ASHA worker — it never invents a facility name or address.
+
+Every result also carries a `fetched_at` timestamp, since "the hospital I found yesterday" and "the hospital I found just now" aren't interchangeable for someone deciding where to go right now.
+
+To see the failure path yourself, simulate the data source being down:
+
+```bash
+uv run python -c "
+import sys; sys.path.insert(0, 'src')
+import health_tools as h, httpx
+httpx.get = lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectTimeout('simulated'))
+print(h.find_facilities('Mumbai'))       # -> falls back to the local list
+print(h.find_facilities('SomeVillage'))  # -> honest 'not_found', nothing invented
+"
+```
+
+### Tool chaining with Day 4's caller memory
+
+`find_nearby_health_facility` takes an optional `district` argument. If the model doesn't pass one, the tool itself calls `db.get_caller()` — the same lookup backing the Day 4 `lookup_caller` tool — and reuses the district saved on that caller's profile (if they previously consented to `save_caller_profile` saving one). This chain is implemented in code, not just prompted, so a returning caller who already shared their district is never asked for it twice. `save_caller_profile` now also accepts a `district` field for this purpose.
+
+### Pushed to the UI
+
+Both tools publish their structured result (not just spoken text) to the room via `local_participant.send_text(..., topic=...)` on `"healthmitra-triage"` / `"healthmitra-facility"`. The frontend (`frontend/components/app/health-data-panel.tsx`) subscribes with `useTextStream` and renders each result as its own card in a horizontal rail — new cards land on the right and the rail auto-scrolls to them, sliding earlier cards left rather than growing the page taller. Facility names/addresses and the triage level are visible on screen while the agent is still speaking them, not just spoken once and gone.
+
+`agent.py`'s `metrics_collected` handler publishes STT/TTS pipeline latency the same way, on topic `"healthmitra-metrics"` — EOU transcription delay for "how long until it heard you," TTS time-to-first-byte for "how long until it started speaking." The frontend shows both live in `frontend/components/app/metrics-panel.tsx`, bottom-left of the page.
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):

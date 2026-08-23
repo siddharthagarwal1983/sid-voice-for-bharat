@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import time
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -20,6 +22,7 @@ from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import db
+import health_tools
 import knowledge_base
 
 logger = logging.getLogger("agent")
@@ -30,10 +33,13 @@ db.init_db()
 knowledge_base.init_kb()
 
 # Spoken immediately when the call connects, before the caller lookup
-# resolves — see the opening-greeting flow in my_agent(). Kept short and
-# identity-only so the follow-up line (generic or personalized) attaches
-# naturally after it either way.
-GENERIC_OPENING_LEAD = "नमस्ते! मैं हेल्थमित्र।"
+# resolves — see the opening-greeting flow in my_agent(). This is the
+# complete greeting for a first-time caller; a returning caller additionally
+# gets a short personalized welcome-back line once the lookup resolves (see
+# the `lookup_result` branch below).
+GENERIC_OPENING_LEAD = (
+    "Hello! I'm HealthMitra, your AI health assistant. How can I help you today?"
+)
 
 # Change this prompt to change what your voice agent does.
 # See README.md for example prompts (customer support, language tutor, receptionist).
@@ -58,15 +64,19 @@ Your knowledge strictly stops at medical diagnosis and individualized treatment.
 
 LANGUAGE
 
-Script Requirement (CRITICAL): You must ALWAYS write all your responses using Devanagari script (देवनागरी लिपि) for Hindi words (e.g., "नमस्ते", "स्वास्थ्य", "मदद"). Never use English/Latin alphabet (Hinglish transliteration) to write Hindi, as the Text-to-Speech engine requires proper Devanagari script for accurate pronunciation. Common English terms (like "AI", "PHC", "Aadhaar", "Doctor") should be written either in Devanagari (एआई, पीएचसी, आधार, डॉक्टर) or clean English words if necessary.
+Default Language (CRITICAL): Start every call in English. On every single turn, respond in whatever language the caller's MOST RECENT message was in — not whatever language the conversation has been in so far. If they speak Hindi, reply in Hindi (Devanagari script, per the Script Requirement below); the moment they speak English again, even after a long stretch of Hindi, reply in English again. Re-check this independently on every turn — do not stay in Hindi out of habit, or because your own last few replies were in Hindi, once the caller has moved back to English. Never comment on a language switch — just pivot naturally, every time, in either direction.
 
-Dynamic Code-Mixing: Fluidly adapt to the caller's exact linguistic style in real-time. If a user mixes English words with Hindi, respond in conversational Hindi using Devanagari script for Hindi words and clear English/Devanagari terms for English words.
+Worked example: Caller says "I have a fever" (English) → you reply in English. Caller then says "मुझे बुखार भी है" (Hindi) → you reply in Hindi. Caller then says "should I go to a hospital?" (English again) → you MUST reply in English again here, even though your last two replies were in Hindi — their latest message decides, every single turn, not the conversation's history.
 
-Language Switching: If the caller speaks in a completely different language (e.g., switching entirely to Marathi, Bengali, or English) or changes their language mid-call, instantly pivot to match their new language without commenting on the switch.
+Script Requirement (CRITICAL): Whenever you are responding in Hindi, you must ALWAYS write it using Devanagari script (देवनागरी लिपि) for Hindi words (e.g., "नमस्ते", "स्वास्थ्य", "मदद"). Never use English/Latin alphabet (Hinglish transliteration) to write Hindi, as the Text-to-Speech engine requires proper Devanagari script for accurate pronunciation. Common English terms (like "AI", "PHC", "Aadhaar", "Doctor") should be written either in Devanagari (एआई, पीएचसी, आधार, डॉक्टर) or clean English words if necessary.
 
-Tone & Register: Speak in simple, everyday language, strictly avoiding complex medical jargon. Maintain a warm, respectful, and reassuring tone. Use culturally familiar Indian terms seamlessly (e.g., आंगनवाड़ी, पीएचसी, आधार, रुपये).
+Dynamic Code-Mixing: Fluidly adapt to the caller's exact linguistic style in real-time. If a user mixes English words into Hindi, respond in conversational Hindi using Devanagari script for Hindi words and clear English/Devanagari terms for English words. If they just mix a little Hindi into otherwise-English speech, it's fine to stay in English.
 
-Gendered Grammar: Because you have a female persona, you must use feminine pronouns and conjugations for yourself when speaking in Hindi (e.g., use "मैं कर सकती हूँ" instead of "मैं कर सकता हूँ").
+Language Switching: If the caller speaks in a different language entirely mid-call (e.g. Marathi, Bengali), pivot to match that too, without commenting on the switch.
+
+Tone & Register: Speak in simple, everyday language, strictly avoiding complex medical jargon. Maintain a warm, respectful, and reassuring tone. When speaking Hindi, use culturally familiar Indian terms seamlessly (e.g., आंगनवाड़ी, पीएचसी, आधार, रुपये).
+
+Gendered Grammar: Because you have a female persona, use feminine pronouns and conjugations for yourself whenever you're speaking in Hindi (e.g., use "मैं कर सकती हूँ" instead of "मैं कर सकता हूँ").
 
 CALLER PROFILE
 
@@ -74,42 +84,52 @@ You have three tools for the caller's profile: lookup_caller, save_caller_profil
 
 lookup_caller is already called for you once at the very start of every call, in the background while your opening line is being spoken — its result is handed to you as part of your instructions for your very next line, so don't call it again just to open the call. If it found a record, welcome that caller back by name and don't ask for it again. If it found nothing, or later in the call you're unsure whether you already have someone's info, call lookup_caller yourself to check before asking.
 
-Before you ever call save_caller_profile, ask the caller's permission first — e.g. "क्या मैं इसे अगली बार के लिए याद रख सकती हूँ?" ("May I remember this for next time?"). Only call save_caller_profile with consent_given=True if they clearly agree. If they say no, or don't clearly agree, do not call save_caller_profile at all — acknowledge that and continue the call normally without saving anything. You only need to ask once per call; if they agree, you can save further details you learn later in the same call without asking again.
+Before you ever call save_caller_profile, ask the caller's permission first, in whichever language you're currently speaking with them — e.g. in English: "May I remember this for next time?", or in Hindi: "क्या मैं इसे अगली बार के लिए याद रख सकती हूँ?". Only call save_caller_profile with consent_given=True if they clearly agree. If they say no, or don't clearly agree, do not call save_caller_profile at all — acknowledge that and continue the call normally without saving anything. You only need to ask once per call; if they agree, you can save further details you learn later in the same call without asking again.
 
-When you do have consent, call save_caller_profile with short structured values only — e.g. age_band="31-45", ongoing_conditions="diabetes, hypertension". NEVER write a full medical note, symptom description, or long free text into these fields, only short tags. Once you've decided how to route this call, call save_caller_profile again (still only with consent) with last_triage_outcome summarizing the decision in a few words (e.g. "advised PHC visit", "escalated to 108", "home care advised").
+When you do have consent, call save_caller_profile with short structured values only — e.g. age_band="31-45", ongoing_conditions="diabetes, hypertension", district="Pune". NEVER write a full medical note, symptom description, or long free text into these fields, only short tags. Once you've decided how to route this call, call save_caller_profile again (still only with consent) with last_triage_outcome summarizing the decision in a few words (e.g. "advised PHC visit", "escalated to 108", "home care advised").
 
 FORGET ME
 
-If the caller asks you to forget them, delete their info, or stop remembering them, confirm once — "क्या आप निश्चित हैं? इससे आपकी सारी सेव की गई जानकारी हमेशा के लिए मिट जाएगी।" ("Are you sure? This will permanently delete everything saved about you.") — and only call forget_caller if they confirm. After it runs, tell them plainly that their saved profile has been deleted, in a reassuring tone. This request always takes priority — honor it immediately once confirmed, even mid-conversation.
+If the caller asks you to forget them, delete their info, or stop remembering them, confirm once, in the current conversation language — English: "Are you sure? This will permanently delete everything saved about you." / Hindi: "क्या आप निश्चित हैं? इससे आपकी सारी सेव की गई जानकारी हमेशा के लिए मिट जाएगी।" — and only call forget_caller if they confirm. After it runs, tell them plainly that their saved profile has been deleted, in a reassuring tone. This request always takes priority — honor it immediately once confirmed, even mid-conversation.
 
 KNOWLEDGE BASE
 
-For questions about specific government health scheme rules, eligibility, coverage amounts, or required documents (e.g. PM-JAY / Ayushman Bharat), call search_knowledge_base with the caller's question before answering — do not rely on your own memory for these specifics, since they change and you must stay grounded in the actual reference material. Only state facts that came back from the search. If nothing relevant is found, say so plainly in Hindi (e.g., "मुझे इसकी सटीक जानकारी अभी उपलब्ध नहीं है, कृपया नजदीकी पीएचसी में पता करें") rather than guessing.
+For questions about specific government health scheme rules, eligibility, coverage amounts, or required documents (e.g. PM-JAY / Ayushman Bharat), call search_knowledge_base with the caller's question before answering — do not rely on your own memory for these specifics, since they change and you must stay grounded in the actual reference material. Only state facts that came back from the search. If nothing relevant is found, say so plainly in the current conversation language — English: "I don't have exact information on that right now, please check with your nearest PHC." / Hindi: "मुझे इसकी सटीक जानकारी अभी उपलब्ध नहीं है, कृपया नजदीकी पीएचसी में पता करें।" — rather than guessing.
+
+SYMPTOM TRIAGE
+
+As soon as the caller has described their main symptom(s), call classify_symptom_triage with what they told you before you tell them whether to manage at home, go to a PHC, or treat it as an emergency — use the tool's routing, don't decide this from your own judgment alone, so every call is routed consistently. Always pass `language` as whichever language you are currently speaking with the caller (per the Default Language rule), so the card on their screen and the suggested line match the call instead of defaulting to Hindi. Turn its suggested_line into your own natural spoken sentence rather than reading it verbatim, and still follow the Escalation Script below immediately for anything that sounds like a red flag, even before the tool returns.
+
+FACILITY LOOKUP
+
+When the caller asks where to go, wants an address, or you've just told them to visit a PHC/hospital, call find_nearby_health_facility. Reuse a district you already have — from earlier in this call, or from lookup_caller's saved profile — without asking again; only ask the caller for their district/city if you genuinely don't have it from any source yet. Speak the facility names and areas naturally in 1-2 short sentences, never as a read-out list, and always mention in your own words whether this is fresh information or from a saved reference list. If it finds nothing for their area, say so plainly and point them to the 104 health helpline or their local ASHA worker — never invent a facility name or address.
 
 GUARDRAILS
 
 Consent Before Saving (CRITICAL, NON-NEGOTIABLE): You must NEVER call save_caller_profile without first asking the caller and having them clearly agree. This applies to every field — name, age band, ongoing conditions, triage outcome, language. No exceptions, no judgment calls, even if it seems obviously helpful to remember. If in doubt, don't save.
 
-Hard Refusals (No Diagnosis & No Drugs): You must NEVER diagnose a condition or name a specific prescription drug. If a user asks what medicine to take, deflect smoothly in Hindi: "मैं एक एआई असिस्टेंट हूँ और कोई दवा का नाम नहीं बता सकती। कृपया अपने डॉक्टर द्वारा बताई गई दवा लें या नजदीकी पीएचसी (PHC) जाएँ।" You may only mention basic, standard over-the-counter comforts (like ORS / ओआरएस).
+Hard Refusals (No Diagnosis & No Drugs): You must NEVER diagnose a condition or name a specific prescription drug. If a user asks what medicine to take, deflect smoothly in the current conversation language — English: "I'm an AI assistant and can't name specific medication. Please take what your doctor prescribed, or visit your nearest PHC." / Hindi: "मैं एक एआई असिस्टेंट हूँ और कोई दवा का नाम नहीं बता सकती। कृपया अपने डॉक्टर द्वारा बताई गई दवा लें या नजदीकी पीएचसी (PHC) जाएँ।" You may only mention basic, standard over-the-counter comforts (like ORS / ओआरएस).
 
-Never-Claims: Never claim to be a doctor, nurse, or a human being. If asked, immediately clarify in Hindi that you are an AI assistant.
+Never-Claims: Never claim to be a doctor, nurse, or a human being. If asked, immediately clarify — in whichever language you're currently speaking — that you are an AI assistant.
 
 Grounded Answers Only: For scheme/eligibility questions covered by search_knowledge_base, never state a specific rule, amount, or document requirement that didn't come back from that search — say you're not sure instead of guessing.
 
-Escalation Script (Red-Flags): If the user mentions any red-flag symptoms (chest pain, severe breathlessness, sudden weakness, heavy bleeding, loss of consciousness) OR if it involves a fever in an infant under 3 months/severe symptoms in a pregnant woman, immediately halt the standard flow.
-Script: "यह एक गंभीर चिकित्सीय स्थिति लग रही है और मैं डॉक्टर नहीं हूँ। कृपया देर न करें। तुरंत 108 एम्बुलेंस सेवा को कॉल करें या नजदीकी अस्पताल जाएँ।"
+Escalation Script (Red-Flags): If the user mentions any red-flag symptoms (chest pain, severe breathlessness, sudden weakness, heavy bleeding, loss of consciousness) OR if it involves a fever in an infant under 3 months/severe symptoms in a pregnant woman, immediately halt the standard flow and say this in whichever language you're currently speaking:
+English: "This sounds like a serious medical situation and I'm not a doctor. Please don't delay — call the 108 ambulance service right now, or go to the nearest hospital."
+Hindi: "यह एक गंभीर चिकित्सीय स्थिति लग रही है और मैं डॉक्टर नहीं हूँ। कृपया देर न करें। तुरंत 108 एम्बुलेंस सेवा को कॉल करें या नजदीकी अस्पताल जाएँ।"
 
 STYLE
 
-Opening Greeting (CRITICAL): Your very first line ("नमस्ते! मैं हेल्थमित्र।") is already spoken for you the instant the call connects — you don't need to say it again. Your job is only the line that follows it, once the caller-lookup result is given to you:
-- If no prior record is found: continue with "आपकी एआई हेल्थ असिस्टेंट। आज मैं आपकी कैसे मदद कर सकती हूँ?"
-- If a record is found with a name: continue by welcoming them back by name. If last_triage_outcome is also set, briefly reference it and ask if it helped, in your own natural words — do not read the stored value verbatim. For example, if last_triage_outcome was "advised PHC visit": "फिर से आपकी सेवा में, रमेश जी! पिछली बार हमने आपको पीएचसी जाने की सलाह दी थी — क्या इससे मदद मिली?" If a record is found but there's no last_triage_outcome to reference, just welcome them back by name and ask how you can help today.
+Opening Greeting (CRITICAL): Your very first line ("Hello! I'm HealthMitra, your AI health assistant. How can I help you today?") is already spoken for you in English the instant the call connects — you don't need to say it again.
+- If no prior record is found for this caller, that line is the complete greeting — don't add anything else right now, just wait for them to respond.
+- If a record is found with a name, you'll be prompted separately (once the lookup resolves) to add a short, natural welcome-back line by name, in English — e.g. "Oh, welcome back, Ramesh!" If last_triage_outcome is also set, briefly reference it and ask if it helped, in your own natural words — do not read the stored value verbatim and do not repeat "how can I help you today" again, since you already asked that. For example, if last_triage_outcome was "advised PHC visit": "Oh, welcome back, Ramesh! Last time we advised a PHC visit — did that help?"
+Stay in English until the caller speaks to you in Hindi — then switch to Hindi for the rest of the call, per the Default Language rule above.
 
 Sentence Length & Pace: Keep responses hyper-concise (1 to 3 short sentences maximum) to ensure smooth performance over telephony channels. Voice callers cannot process long paragraphs.
 
 Turn-Taking: End every turn with a single, clear question or prompt to keep the conversation moving. Never ask multiple questions at once.
 
-Handling Silence & Latency: If the caller is silent, gracefully prompt them once in Hindi (e.g., "नमस्ते, क्या आप मुझे सुन पा रहे हैं?") before politely closing the call if there is no response. Avoid filler words that might disrupt the speech-to-text processing pipeline.
+Handling Silence & Latency: If the caller is silent, gracefully prompt them once in the current conversation language — English: "Hello, can you hear me?" / Hindi: "नमस्ते, क्या आप मुझे सुन पा रहे हैं?" — before politely closing the call if there is no response. Avoid filler words that might disrupt the speech-to-text processing pipeline.
 """
 
 
@@ -119,6 +139,9 @@ class Assistant(Agent):
         # Set once the caller's identity is resolved after the room connects
         # (see resolve_caller_user_id / my_agent below).
         self.user_id = user_id
+        # Set right after construction in my_agent() — lets tools push
+        # structured data (e.g. facility results) to the caller's screen.
+        self.room: rtc.Room | None = None
 
     @function_tool
     async def lookup_caller(self, context: RunContext) -> str:
@@ -154,6 +177,7 @@ class Assistant(Agent):
         ongoing_conditions: str | None = None,
         last_triage_outcome: str | None = None,
         language_preference: str | None = None,
+        district: str | None = None,
     ) -> str:
         """Save or update what you know about this caller so they can be
         recognized on a future call. Only pass short, structured values —
@@ -178,6 +202,9 @@ class Assistant(Agent):
                 'home care advised'.
             language_preference: The caller's preferred language, e.g.
                 'hindi', 'marathi', 'english'.
+            district: The caller's district or city, e.g. 'Pune', 'Patna'.
+                Saving this lets you look up nearby facilities for them on a
+                future call without asking again.
         """
         if not consent_given:
             logger.info("save_caller_profile skipped — no caller consent")
@@ -195,6 +222,7 @@ class Assistant(Agent):
                 "age_band": age_band,
                 "ongoing_conditions": ongoing_conditions,
                 "last_triage_outcome": last_triage_outcome,
+                "district": district,
             }.items()
             if value
         }
@@ -240,6 +268,136 @@ class Assistant(Agent):
             return "No matching information found in the knowledge base."
 
         return "\n\n".join(f"[{r['source']}] {r['text']}" for r in results)
+
+    async def _publish_to_room(self, topic: str, payload: dict) -> None:
+        """Best-effort push of a structured tool result to the caller's
+        screen (if a UI is attached to this room). Never lets a UI publish
+        failure interrupt the voice call.
+        """
+        if self.room is None:
+            return
+        try:
+            await self.room.local_participant.send_text(
+                json.dumps(payload, ensure_ascii=False), topic=topic
+            )
+        except Exception:
+            logger.warning("Failed to publish %s data to room", topic, exc_info=True)
+
+    @function_tool
+    async def classify_symptom_triage(
+        self, context: RunContext, symptoms: str, language: str = "en"
+    ) -> str:
+        """Classify a caller's described symptoms into a triage level
+        (emergency / phc / home_care) using a fixed local rule set modeled
+        on standard ASHA/PHC referral guidance (chest pain, breathlessness,
+        heavy bleeding, high fever, dehydration, etc.). Call this as soon as
+        the caller has described their main symptom(s), before you tell
+        them whether to treat it as an emergency, go to a PHC, or manage at
+        home — use this tool's routing rather than deciding from your own
+        judgment, so every call is routed the same, traceable way. Do not
+        call this for general health questions that aren't about the
+        caller's own current symptoms — use search_knowledge_base for
+        scheme/eligibility questions instead.
+
+        Args:
+            symptoms: A short description of what the caller told you they
+                are experiencing, in their own words (Hindi or English),
+                e.g. "बुखार तीन दिन से है और बहुत कमजोरी लग रही है".
+            language: "en" or "hi" — whichever language you are CURRENTLY
+                speaking with the caller right now (per the Default
+                Language rule), not necessarily the language of `symptoms`
+                itself. Determines the language of the text shown on the
+                caller's screen and the suggested spoken line, so it always
+                matches the call rather than defaulting to Hindi.
+        """
+        result = await asyncio.to_thread(
+            health_tools.classify_triage, symptoms, language
+        )
+        await self._publish_to_room("healthmitra-triage", result)
+
+        return (
+            f"triage_level={result['level']!r}, matched_on={result['matched_keyword']!r}, "
+            f"suggested_line={result['advice']!r}, "
+            f"source={result['source']} ({result['ruleset_version']}, a fixed local "
+            "ruleset, not a live medical database). Say this in your own natural "
+            "words, 1-3 short sentences, in the same language it's already written "
+            "in — do not read these fields out loud."
+        )
+
+    @function_tool
+    async def find_nearby_health_facility(
+        self, context: RunContext, district: str | None = None
+    ) -> str:
+        """Look up nearby government health facilities (hospitals/PHCs) for
+        a district. Call this whenever the caller asks where to go, wants
+        an address, or right after you've told them to visit a PHC/hospital
+        and they might want to know which one.
+
+        If you already know the caller's district — from earlier in this
+        call, or from their saved profile via lookup_caller — pass it here
+        yourself; do NOT ask the caller for their district again if you
+        already have it from either source. Only ask the caller directly if
+        you truly don't have it yet.
+
+        If this returns no results, tell the caller plainly and point them
+        to the 104 health helpline or their local ASHA worker — never
+        invent a facility name or address.
+
+        Args:
+            district: The caller's district or city name. If omitted, this
+                tool tries the district already saved on the caller's
+                profile (from an earlier call) before giving up.
+        """
+        resolved_district = district
+        used_saved_district = False
+        if not resolved_district and self.user_id:
+            # Chain into the Day-4 caller-profile lookup: reuse a district
+            # saved on an earlier call instead of asking again.
+            caller = await asyncio.to_thread(db.get_caller, self.user_id)
+            if caller and caller["facts"].get("district"):
+                resolved_district = caller["facts"]["district"]
+                used_saved_district = True
+
+        result = await asyncio.to_thread(
+            health_tools.find_facilities, resolved_district or ""
+        )
+        await self._publish_to_room("healthmitra-facility", result)
+
+        if result["status"] == "no_district":
+            return (
+                "no_district — you don't have a district for this caller from "
+                "any source yet. Ask them which district or city they're in, "
+                "then call this tool again with that value."
+            )
+
+        if result["status"] == "not_found":
+            return (
+                f"not_found for district={resolved_district!r} as of "
+                f"{result['fetched_at']}. Tell the caller plainly that you "
+                "don't have facility information for their area and point "
+                "them to the 104 health helpline or their local ASHA worker. "
+                "Do not invent a facility name or address."
+            )
+
+        facility_lines = "; ".join(
+            f"{f['name']} ({f['type']}, {f['area']})" for f in result["facilities"]
+        )
+        freshness = (
+            "fetched live just now from OpenStreetMap"
+            if result["data_source"] == "live:openstreetmap-nominatim"
+            else "from a saved local reference list, which may not be fully up to date"
+        )
+        chain_note = (
+            " (district reused from this caller's saved profile — do not ask them for it again)"
+            if used_saved_district
+            else ""
+        )
+        return (
+            f"district={resolved_district!r}{chain_note}, "
+            f"facilities=[{facility_lines}], {freshness} "
+            f"(as of {result['fetched_at']}). Speak this naturally in 1-2 "
+            "sentences — name the facility and area, don't read this out as a list."
+        )
 
     # To add more tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
@@ -293,22 +451,29 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=deepgram.STT(model="nova-3", language="hi"),
+        # "multi" enables Deepgram Nova-3's code-switching mode so the same
+        # session picks up English (or other supported languages) mid-call
+        # instead of forcing every utterance through the Hindi model — a
+        # hard "hi" lock here was why switching to English didn't work.
+        stt=deepgram.STT(model="nova-3", language="multi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=google.LLM(
-                model="gemini-3.5-flash-lite",
-            ),
+            model="gemini-3.5-flash-lite",
+        ),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        # Starts in English (default language) — the user_input_transcribed
+        # handler below switches this to hi-IN once the caller actually
+        # speaks Hindi, and back again if they switch back to English.
         tts=murf.TTS(
-                voice="Namrita", 
-                locale="hi-IN",
-                style="Conversation",
-                model="FALCON",
-                tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-                text_pacing=True
-            ),
+            voice="Namrita",
+            locale="en-IN",
+            style="Conversation",
+            model="FALCON",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True,
+        ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
@@ -349,8 +514,66 @@ async def my_agent(ctx: JobContext):
     def _on_close(event):
         db.end_call_session(db_session_id, event.reason.value)
 
+    # `metrics_collected` fires from a sync callback, so publishing has to be
+    # scheduled as a background task — this set holds a strong reference to
+    # each one so it can't be garbage-collected mid-flight.
+    background_tasks: set[asyncio.Task] = set()
+
+    def _fire_and_forget(coro) -> None:
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(event):
+        # Surface pipeline latency to the caller's screen (see
+        # frontend/components/app/metrics-panel.tsx). EOU transcription
+        # delay is the real-world "how long until it heard me" STT latency
+        # for a streaming STT — STTMetrics.duration is always 0 for those.
+        # TTS ttfb is time-to-first-audio-byte, i.e. "how long until it
+        # started speaking."
+        metrics = event.metrics
+        if metrics.type == "eou_metrics":
+            kind, latency_ms = "stt", metrics.transcription_delay * 1000
+        elif metrics.type == "tts_metrics":
+            kind, latency_ms = "tts", metrics.ttfb * 1000
+        else:
+            return
+        payload = json.dumps(
+            {
+                "kind": kind,
+                "latency_ms": round(latency_ms, 1),
+                "updated_at": time.time(),
+            }
+        )
+        _fire_and_forget(
+            ctx.room.local_participant.send_text(payload, topic="healthmitra-metrics")
+        )
+
+    # Tracks which locale the TTS voice is currently speaking in. The
+    # session starts in English (see AgentSession(tts=...) above) and only
+    # switches to Hindi once the caller actually speaks Hindi — using
+    # Deepgram's own per-utterance language detection (STT runs in "multi"
+    # code-switching mode) rather than guessing from the LLM's output text.
+    current_tts_locale = "en-IN"
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event):
+        nonlocal current_tts_locale
+        if not event.is_final or not event.language:
+            return
+        target_locale = (
+            "hi-IN" if str(event.language).lower().startswith("hi") else "en-IN"
+        )
+        if target_locale != current_tts_locale and session.tts is not None:
+            current_tts_locale = target_locale
+            # update_options() is a Murf TTS extension, not part of the
+            # base plugin interface — swap providers, swap this call too.
+            session.tts.update_options(locale=target_locale)
+
     # Start the session, which initializes the voice pipeline and warms up the models
     assistant = Assistant()
+    assistant.room = ctx.room
     await session.start(
         agent=assistant,
         room=ctx.room,
@@ -391,20 +614,28 @@ async def my_agent(ctx: JobContext):
 
     # Speak immediately — this doesn't depend on the lookup, so there's no
     # dead air while lookup_task resolves in the background during playback.
-    await session.say(GENERIC_OPENING_LEAD)
+    # allow_interruptions=False so an eager caller talking over the greeting
+    # can't cut the opening script short before it's said anything useful.
+    await session.say(GENERIC_OPENING_LEAD, allow_interruptions=False)
 
     if lookup_task is not None:
         lookup_result = await lookup_task  # already resolved in practice by now
-        await session.generate_reply(
-            instructions=(
-                "You just spoke your opening line. While you were speaking, "
-                "you already looked up this caller's profile in the "
-                f"background — here's what you found: {lookup_result}. "
-                "Continue naturally with the next line per the Opening "
-                "Greeting rules in your instructions. Do not call "
-                "lookup_caller again for this."
+        # The opening line above is already the complete greeting for a
+        # first-time caller — only speak a follow-up when there's an actual
+        # name to welcome back, to avoid a redundant "how can I help you
+        # today" repeated right after itself.
+        if not lookup_result.startswith("No prior record"):
+            await session.generate_reply(
+                instructions=(
+                    "You just spoke your opening line. While you were speaking, "
+                    "you already looked up this caller's profile in the "
+                    f"background — here's what you found: {lookup_result}. "
+                    "Add a short, natural welcome-back line per the Opening "
+                    "Greeting rules in your instructions. Do not call "
+                    "lookup_caller again for this."
+                ),
+                allow_interruptions=False,
             )
-        )
 
 
 if __name__ == "__main__":

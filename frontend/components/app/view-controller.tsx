@@ -51,6 +51,13 @@ export function ViewController({ appConfig }: ViewControllerProps) {
     ? 'blocked'
     : deriveUiPhase(isConnected, agentState as Parameters<typeof deriveUiPhase>[1], showEnded);
 
+  // Temporary console-only diagnostic for the transcript-not-appearing
+  // report — not a UI element, just visible in DevTools. Safe to remove
+  // once that's confirmed fixed.
+  useEffect(() => {
+    console.log('[HealthMitra debug] messages:', messages.length, 'phase:', phase);
+  }, [messages, phase]);
+
   const handleStart = () => {
     setShowEnded(false);
     setMicBlocked(false);

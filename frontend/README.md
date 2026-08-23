@@ -51,23 +51,26 @@ Edit [`app-config.ts`](app-config.ts) to change branding, features, and button t
 
 ```ts
 export const APP_CONFIG_DEFAULTS: AppConfig = {
-  companyName: 'Murf AI',
-  pageTitle: 'Voice Agent Starter',
-  pageDescription: 'A voice agent powered by Murf Falcon — the fastest TTS API',
+  companyName: 'HealthMitra',
+  pageTitle: 'HealthMitra — Your AI Health Companion',
+  pageDescription:
+    'An AI health companion for callers across India — symptom guidance, PHC referrals, and government health scheme info in Hindi and English.',
 
   supportsChatInput: true,
   supportsVideoInput: true,
   supportsScreenShare: true,
 
-  logo: '/murf-logo.svg',
-  accent: '#6366F1',
-  logoDark: '/murf-logo-dark.svg',
-  accentDark: '#818cf8',
-  startButtonText: 'Start talking',
+  logo: '/healthmitra-logo.png',
+  accent: '#0f766e', // teal — calm, trustworthy, distinct from the destructive-red error state
+  logoDark: '/healthmitra-logo.png', // full-color mark, same file works on both themes
+  accentDark: '#2dd4bf',
+  startButtonText: 'Start talking', // default UI text is English; the agent itself starts in English and switches to Hindi if the caller does
 
   agentName: process.env.AGENT_NAME ?? undefined,
 };
 ```
+
+This starter's own UI (`components/app/agent-state-view.tsx`) is themed for HealthMitra as a worked example — swap `app-config.ts` and that component's copy for your own use case.
 
 ### Audio visualizers
 

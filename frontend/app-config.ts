@@ -33,19 +33,22 @@ export interface AppConfig {
 }
 
 export const APP_CONFIG_DEFAULTS: AppConfig = {
-  companyName: 'Murf AI',
-  pageTitle: 'Voice Agent Starter',
-  pageDescription: 'A voice agent powered by Murf Falcon — the fastest TTS API',
+  companyName: 'HealthMitra',
+  pageTitle: 'HealthMitra — Your AI Health Companion',
+  pageDescription:
+    'An AI health companion for callers across India — symptom guidance, PHC referrals, and government health scheme info in Hindi and English.',
 
   supportsChatInput: true,
   supportsVideoInput: true,
   supportsScreenShare: true,
   isPreConnectBufferEnabled: true,
 
-  logo: '/murf-logo.svg',
-  accent: '#6366F1',
-  logoDark: '/murf-logo-dark.svg',
-  accentDark: '#818cf8',
+  // Same artwork for both themes — it's a full-color illustration, not a
+  // monochrome mark, so it reads cleanly on light and dark backgrounds.
+  logo: '/healthmitra-logo.png',
+  accent: '#0f766e',
+  logoDark: '/healthmitra-logo.png',
+  accentDark: '#2dd4bf',
   startButtonText: 'Start talking',
 
   // optional: audio visualization configuration

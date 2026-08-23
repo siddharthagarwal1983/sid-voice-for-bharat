@@ -1,6 +1,7 @@
 import { Public_Sans } from 'next/font/google';
 import localFont from 'next/font/local';
 import { headers } from 'next/headers';
+import Link from 'next/link';
 import { ThemeProvider } from '@/components/app/theme-provider';
 import { ThemeToggle } from '@/components/app/theme-toggle';
 import { cn } from '@/lib/shadcn/utils';
@@ -71,37 +72,27 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           enableSystem
           disableTransitionOnChange
         >
-          <header className="fixed top-0 left-0 z-50 flex w-full flex-row items-center justify-between p-6">
-            <a
-              target="_blank"
-              rel="noopener noreferrer"
-              href="https://murf.ai"
-              className="flex items-center gap-2"
-            >
+          <header className="border-border/50 bg-background/80 fixed top-0 left-0 z-50 flex w-full flex-row items-center justify-between border-b p-6 backdrop-blur-md">
+            <Link href="/" className="flex items-center gap-2.5">
+              {/* Full-color illustrated mark — same file in light/dark, see app-config.ts */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={logo}
-                alt={`${companyName} Logo`}
-                className="block h-6 w-auto dark:hidden"
-              />
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={logoDark ?? logo}
-                alt={`${companyName} Logo`}
-                className="hidden h-6 w-auto dark:block"
-              />
-              <span className="text-foreground text-sm font-semibold">{companyName}</span>
-            </a>
+              <img src={logo ?? logoDark} alt={`${companyName} Logo`} className="h-10 w-auto" />
+              {/* Bilingual wordmark — Roman + Devanagari, both part of the logo lockup */}
+              <span className="text-foreground flex items-baseline gap-1.5 text-sm leading-none font-semibold">
+                {companyName}
+                <span className="text-muted-foreground text-xs font-normal">हेल्थमित्र</span>
+              </span>
+            </Link>
 
             <span className="text-muted-foreground font-mono text-xs font-medium tracking-wide">
-              Powered by{' '}
+              Voice by{' '}
               <a
                 target="_blank"
                 rel="noopener noreferrer"
-                href="https://docs.livekit.io/agents"
+                href="https://murf.ai"
                 className="text-foreground underline underline-offset-4"
               >
-                LiveKit
+                Murf Falcon
               </a>
             </span>
           </header>
