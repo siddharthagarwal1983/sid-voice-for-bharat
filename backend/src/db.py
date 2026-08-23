@@ -64,6 +64,32 @@ def init_db() -> None:
             )
             """
         )
+        # One row per outbound dial attempt (see agent.py's OUTBOUND CALLS
+        # handling). `outcome` is one of: answered, no_answer, busy,
+        # voicemail, immediate_hangup, failed. `next_retry_at` is set only
+        # for outcomes the retry policy says to retry, and only while
+        # `retried` is still 0 — scripts/retry_outbound_calls.py flips it to
+        # 1 once it has dispatched the follow-up attempt, so a due row is
+        # never picked up twice.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_call_attempts (
+                id TEXT PRIMARY KEY,
+                phone_number TEXT NOT NULL,
+                call_type TEXT,
+                detail TEXT,
+                attempt_number INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                attempted_at REAL NOT NULL,
+                next_retry_at REAL,
+                retried INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_attempts_retry "
+            "ON outbound_call_attempts(next_retry_at, retried)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -189,6 +215,76 @@ def end_call_session(session_id: str, close_reason: str) -> None:
         conn.execute(
             "UPDATE call_sessions SET ended_at = ?, close_reason = ? WHERE id = ?",
             (time.time(), close_reason, session_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_outbound_attempt(
+    *,
+    phone_number: str,
+    call_type: str | None,
+    detail: str | None,
+    attempt_number: int,
+    outcome: str,
+    next_retry_at: float | None,
+) -> str:
+    """Log one outbound dial attempt and its outcome. Returns the row id."""
+    attempt_id = str(uuid.uuid4())
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO outbound_call_attempts
+                (id, phone_number, call_type, detail, attempt_number, outcome,
+                 attempted_at, next_retry_at, retried)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                attempt_id,
+                phone_number,
+                call_type,
+                detail,
+                attempt_number,
+                outcome,
+                time.time(),
+                next_retry_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return attempt_id
+
+
+def due_outbound_retries(now: float) -> list[dict]:
+    """Attempts whose retry delay has elapsed and haven't been retried yet.
+    Consumed by scripts/retry_outbound_calls.py.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM outbound_call_attempts
+            WHERE next_retry_at IS NOT NULL AND next_retry_at <= ? AND retried = 0
+            ORDER BY next_retry_at ASC
+            """,
+            (now,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_outbound_retried(attempt_id: str) -> None:
+    """Marks an attempt's retry as dispatched, so due_outbound_retries()
+    never returns it again."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE outbound_call_attempts SET retried = 1 WHERE id = ?",
+            (attempt_id,),
         )
         conn.commit()
     finally:

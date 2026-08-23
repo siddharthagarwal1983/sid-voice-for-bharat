@@ -64,7 +64,9 @@ _SAMPLE_DOCUMENTS = [
 def init_kb() -> None:
     conn = db.get_connection()
     try:
-        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS {_TABLE} USING fts5(source, title, text)")
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {_TABLE} USING fts5(source, title, text)"
+        )
         count = conn.execute(f"SELECT COUNT(*) FROM {_TABLE}").fetchone()[0]
         if count == 0:
             for doc in _SAMPLE_DOCUMENTS:
@@ -124,7 +126,10 @@ def search(query: str, top_k: int = 3) -> list[dict]:
             """,
             (_fts_query(query), top_k),
         ).fetchall()
-        return [{"source": r["source"], "title": r["title"], "text": r["text"]} for r in rows]
+        return [
+            {"source": r["source"], "title": r["title"], "text": r["text"]}
+            for r in rows
+        ]
     except sqlite3.OperationalError:
         # A pathological query (e.g. only stopword-like tokens) can still
         # trip FTS5 syntax in edge cases — fail closed to "no results"

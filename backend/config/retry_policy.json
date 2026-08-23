@@ -1,0 +1,12 @@
+{
+  "_comment": "Outbound call retry rules. See backend/README.md 'Call outcomes & retries'. Loaded fresh on every retry decision (not cached), so editing this file takes effect on the next outbound call without restarting the worker.",
+
+  "enabled": false,
+
+  "outcomes": {
+    "no_answer": { "max_attempts": 3, "delay_minutes": 30 },
+    "busy": { "max_attempts": 3, "delay_minutes": 10 },
+    "voicemail": { "max_attempts": 2, "delay_minutes": 240 },
+    "immediate_hangup": { "max_attempts": 2, "delay_minutes": 1440 }
+  }
+}

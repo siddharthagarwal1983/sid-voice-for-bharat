@@ -1,10 +1,14 @@
 import asyncio
 import json
 import logging
+import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
-from livekit import rtc
+from google.protobuf.duration_pb2 import Duration
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -14,7 +18,6 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
-    inference,
     room_io,
     tokenize,
 )
@@ -104,6 +107,20 @@ FACILITY LOOKUP
 
 When the caller asks where to go, wants an address, or you've just told them to visit a PHC/hospital, call find_nearby_health_facility. Reuse a district you already have — from earlier in this call, or from lookup_caller's saved profile — without asking again; only ask the caller for their district/city if you genuinely don't have it from any source yet. Speak the facility names and areas naturally in 1-2 short sentences, never as a read-out list, and always mention in your own words whether this is fresh information or from a saved reference list. If it finds nothing for their area, say so plainly and point them to the 104 health helpline or their local ASHA worker — never invent a facility name or address.
 
+OUTBOUND CALLS (proactive reminders & follow-ups)
+
+Most calls are inbound — the caller reached you. Some calls are ones YOU are placing (see backend/scripts/make_outbound_call.py) for a specific reason. For these, your instructions for the very first thing you say will tell you the call_type and any detail, plus the caller profile lookup already run for you — don't call lookup_caller again for this. Outbound calls always open differently from inbound: the person didn't choose to call, so identify yourself and the reason for calling immediately, in 1-2 sentences, before anything else. Always in English first, per the Default Language rule.
+
+- call_type="medication_reminder": Introduce yourself briefly as HealthMitra, an AI health assistant calling with a reminder, then state the reminder clearly using the given detail — e.g. "Hi, this is HealthMitra — just a reminder to take your evening metformin dose." Then ask if they've taken it, or if they have any questions, and continue naturally from there.
+
+- call_type="vaccination_reminder": Same pattern, but for a vaccination due — state which vaccine/dose using the given detail, then ask if they have any questions or would like help finding a facility (offer find_nearby_health_facility if so).
+
+- call_type="triage_followup": You're calling to check in after a PREVIOUS call where you routed this caller somewhere. Introduce yourself, then reference their last_triage_outcome from the caller profile lookup in your own natural words — never read it verbatim — and ask how it went or how they're feeling now. Example, if last_triage_outcome was "advised PHC visit": "Hi, this is HealthMitra — I'm calling to follow up on our last conversation. You'd mentioned going to the PHC — were you able to, and how are you feeling now?" If there's no last_triage_outcome on file, ask generally how they've been feeling since you last spoke instead of referencing anything specific.
+
+Whichever type it is, once you've delivered the reason for calling and gotten a response, the rest of the call proceeds exactly like any other — same tools, same Default Language rule, same guardrails — and call end_call per the Ending the Call rule below once it's naturally finished.
+
+Voicemail (CRITICAL): On an outbound call, what picks up isn't always a person. If what you hear after your opening line sounds like an answering machine or voicemail system — a scripted greeting inviting you to leave a message after a tone, mentioning a mailbox, saying the person is unavailable, or the Hindi equivalent (e.g. "कृपया संदेश छोड़ें", "अभी उपलब्ध नहीं है") — call report_voicemail_detected immediately. Then leave ONE short, appropriate message and hang up: for a medication/vaccination reminder, state the reminder briefly and say you'll try again later; for a triage follow-up, say you were checking in and you'll try again later. Do not try to have a conversation with a voicemail greeting, and do not wait through a long greeting before acting — as soon as you're confident it's not live, act. If you're not genuinely confident it's a machine, treat it as a person instead and continue normally — a real but slow or unusually-worded reply is not voicemail.
+
 GUARDRAILS
 
 Consent Before Saving (CRITICAL, NON-NEGOTIABLE): You must NEVER call save_caller_profile without first asking the caller and having them clearly agree. This applies to every field — name, age band, ongoing conditions, triage outcome, language. No exceptions, no judgment calls, even if it seems obviously helpful to remember. If in doubt, don't save.
@@ -129,7 +146,9 @@ Sentence Length & Pace: Keep responses hyper-concise (1 to 3 short sentences max
 
 Turn-Taking: End every turn with a single, clear question or prompt to keep the conversation moving. Never ask multiple questions at once.
 
-Handling Silence & Latency: If the caller is silent, gracefully prompt them once in the current conversation language — English: "Hello, can you hear me?" / Hindi: "नमस्ते, क्या आप मुझे सुन पा रहे हैं?" — before politely closing the call if there is no response. Avoid filler words that might disrupt the speech-to-text processing pipeline.
+Ending the Call (CRITICAL): Nothing else hangs up the call for the caller — you must actively end it yourself, every time, or the call just sits there. As soon as the caller says goodbye, thanks you and indicates they're done, or explicitly asks you to end the call or hang up, say a brief, warm farewell in the current conversation language (English: "Take care, goodbye!" / Hindi: "अपना ख्याल रखें, नमस्ते!") and THEN call end_call in that same turn. Never call end_call before saying goodbye, and never skip calling it once you've said goodbye — a farewell that isn't followed by end_call leaves the caller on a dead line.
+
+Handling Silence & Latency: If the caller is silent, gracefully prompt them once in the current conversation language — English: "Hello, can you hear me?" / Hindi: "नमस्ते, क्या आप मुझे सुन पा रहे हैं?". If there is still no response, say a brief goodbye and call end_call per the Ending the Call rule above rather than waiting indefinitely. Avoid filler words that might disrupt the speech-to-text processing pipeline.
 """
 
 
@@ -142,6 +161,22 @@ class Assistant(Agent):
         # Set right after construction in my_agent() — lets tools push
         # structured data (e.g. facility results) to the caller's screen.
         self.room: rtc.Room | None = None
+        # Set right after construction in my_agent() — lets end_call() below
+        # actually hang up (delete_room), not just stop replying.
+        self.job_ctx: JobContext | None = None
+        # Outbound-call bookkeeping (see OUTBOUND CALLS in SYSTEM_PROMPT and
+        # the outbound branch of my_agent()). None for inbound calls.
+        # outbound_outcome starts as "answered" once a call connects, and
+        # only report_voicemail_detected() / the immediate-hangup room
+        # handler ever override it to something else — my_agent()'s
+        # session.on("close") handler persists whatever it ends up as.
+        self.outbound_call: OutboundCall | None = None
+        self.outbound_outcome: str | None = None
+        # Set by end_call() just before it hangs up, so the SIP
+        # participant-disconnected handler in my_agent() can tell "we ended
+        # this cleanly" apart from "they hung up on us" — both fire the
+        # same disconnect event.
+        self.agent_ended_call = False
 
     @function_tool
     async def lookup_caller(self, context: RunContext) -> str:
@@ -249,6 +284,53 @@ class Assistant(Agent):
         if deleted:
             return "Deleted. This caller's saved profile no longer exists."
         return "There was no saved profile for this caller to delete."
+
+    @function_tool
+    async def end_call(self, context: RunContext) -> None:
+        """Call this to actually hang up and end the call. Call it as soon
+        as the caller says goodbye, thanks you and indicates they're done,
+        or explicitly asks you to end the call / hang up — do not wait for
+        them to disconnect on their own, since nothing else does that for
+        them.
+
+        IMPORTANT ORDER: say your brief farewell line FIRST (in whatever
+        language you're currently speaking), in the same turn, THEN call
+        this tool — never call it before you've said goodbye. This tool
+        itself doesn't speak anything; it waits for your farewell to finish
+        playing, then disconnects the call.
+        """
+        # Let the farewell that was just generated finish playing before
+        # actually hanging up, so it isn't cut off mid-sentence. Must use
+        # RunContext.wait_for_playout() here, not the SpeechHandle's own —
+        # this tool call is itself part of that same speech handle, so
+        # waiting on the handle directly would be a circular self-wait.
+        await context.wait_for_playout()
+
+        self.agent_ended_call = True
+        if self.job_ctx is not None:
+            await self.job_ctx.delete_room()
+
+    @function_tool
+    async def report_voicemail_detected(self, context: RunContext) -> str:
+        """Call this the moment you recognize that the line you're
+        connected to (on an OUTBOUND call) is an answering machine or
+        voicemail system, not a live person — e.g. it plays a scripted
+        greeting inviting you to leave a message after a tone, mentions a
+        mailbox, says the person is unavailable, or similar, in English or
+        Hindi. Be reasonably confident before calling this — a slow or
+        unusual-sounding human response is not voicemail; if genuinely
+        unsure, treat it as a person and continue the conversation normally
+        instead.
+
+        After calling this, per the OUTBOUND CALLS section of your
+        instructions: say a short, appropriate message for the call_type
+        (state the reminder, or that you tried to follow up), mention
+        you'll try again later, THEN call end_call as usual.
+        """
+        if self.outbound_call is None:
+            return "Not applicable — this isn't an outbound call."
+        self.outbound_outcome = "voicemail"
+        return "Recorded. Say your brief message now, then call end_call."
 
     @function_tool
     async def search_knowledge_base(self, context: RunContext, query: str) -> str:
@@ -426,6 +508,235 @@ def resolve_caller_user_id(participant: rtc.RemoteParticipant) -> str:
     return participant.attributes.get("sip.phoneNumber") or participant.identity
 
 
+# Purposeful outbound call types — see scripts/make_outbound_call.py --type.
+# A plain outbound call (phone_number only, no call_type) keeps the original
+# generic-greeting behavior; these three open with the actual reason for
+# calling instead, per the OUTBOUND CALLS section of SYSTEM_PROMPT.
+OUTBOUND_CALL_TYPES = frozenset(
+    {"medication_reminder", "vaccination_reminder", "triage_followup"}
+)
+
+# ---------------------------------------------------------------------------
+# Outbound call outcomes & retry policy.
+#
+# Inbound calls never need this — the caller either connects or they don't
+# call at all. Outbound calls have four failure modes a plain answered/not
+# distinction can't tell apart, each with a different reason to (or not to)
+# try again:
+#
+#   no_answer         Rang out, nobody picked up. They just weren't near
+#                      the phone — try again reasonably soon.
+#   busy              Line engaged right now. Likely free again shortly —
+#                      shorter retry delay than no_answer.
+#   voicemail         Answered by an answering machine, detected by the
+#                      LLM from what it hears after the opening line (see
+#                      report_voicemail_detected below — there's no SIP-
+#                      level signal for this, Twilio's platform AMD isn't
+#                      available over raw SIP trunking). We leave a short
+#                      message and don't call back again soon — repeated
+#                      same-day attempts just fill up their mailbox.
+#   immediate_hangup  They answered and hung up within seconds, before any
+#                      real exchange — a rejection, not a missed call.
+#                      Retrying soon would be intrusive; wait a full day
+#                      and only try once more.
+#   failed            Anything else (invalid number, trunk/carrier error,
+#                      no trunk configured). Retrying the same number
+#                      won't fix a bad number — needs a human to look at
+#                      it, not an automatic retry.
+#   answered          Connected and nothing special was detected — the
+#                      call served its purpose (or ran its natural
+#                      course). No retry needed.
+#
+# Retries aren't executed inline in this job — see
+# scripts/retry_outbound_calls.py, run periodically (e.g. via cron), which
+# queries db.due_outbound_retries() and re-dispatches them.
+#
+# The rules themselves — per-outcome delay and attempt cap, plus a master
+# on/off switch — live in config/retry_policy.json, not here, so they can
+# be tuned (or retries turned off entirely) without a code change or
+# restart. Currently OFF (`"enabled": false` in that file) — outbound
+# outcomes are still recorded and classified as normal, just nothing gets
+# auto-retried while it's off.
+RETRY_POLICY_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "retry_policy.json"
+)
+
+# A SIP participant that disconnects this soon after answering, without us
+# having ended the call ourselves, is almost certainly a rejection rather
+# than a call that ran its course.
+IMMEDIATE_HANGUP_THRESHOLD_SECONDS = 8.0
+
+# Standard SIP final-response codes, mapped to our outcome buckets. Verified
+# against two real TwirpErrors from this project's own LiveKit SIP service
+# (see backend/README.md "Outbound calling" for the probes used to confirm
+# these):
+#
+#   1. A call the FAR END actively rejects (e.g. carrier/account rejection)
+#      raises TwirpError with `sip_status_code` / `sip_status` in
+#      `.metadata` — a real SIP status forwarded from the other side.
+#   2. A call that just rings out (nobody answers before ringing_timeout)
+#      raises TwirpError(code="canceled", message="...sip request timed
+#      out...") with NO sip_status_code in `.metadata` at all — LiveKit
+#      cancels client-side rather than forwarding a SIP status, since the
+#      far end never sent one. Metadata-only classification misses this
+#      entirely and silently mislabels every ring-timeout as "failed" — a
+#      real bug caught by actually placing a no-answer test call, not by
+#      inspection.
+#
+# Anything matching neither pattern — an unrecognized sip_status_code, or
+# an error with no metadata and no "timed out" wording (e.g. no trunk
+# configured, malformed request) — falls back to "failed".
+_SIP_BUSY_CODES = {"486", "600", "603"}  # Busy Here / Busy Everywhere / Decline
+_SIP_NO_ANSWER_CODES = {
+    "408",
+    "480",
+    "487",
+}  # Timeout / Temporarily Unavailable / Terminated
+
+
+def _classify_sip_error(error: api.TwirpError) -> str:
+    code = (error.metadata or {}).get("sip_status_code")
+    if code in _SIP_BUSY_CODES:
+        return "busy"
+    if code in _SIP_NO_ANSWER_CODES:
+        return "no_answer"
+    if error.code == "canceled" or "timed out" in error.message.lower():
+        return "no_answer"
+    return "failed"
+
+
+def _load_retry_policy() -> dict:
+    """Re-read on every call rather than cached at import — a config file
+    is only worth having if editing it takes effect without a restart.
+    Any problem reading it (missing file, bad JSON) fails closed to "no
+    retries" rather than crashing an otherwise-fine outbound call.
+    """
+    try:
+        with RETRY_POLICY_PATH.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(
+            "Failed to load retry policy from %s: %s — treating retries as disabled",
+            RETRY_POLICY_PATH,
+            e,
+        )
+        return {"enabled": False, "outcomes": {}}
+
+
+def next_retry_at(outcome: str, attempt_number: int) -> float | None:
+    """When the NEXT attempt should happen, or None if retries are
+    disabled, this outcome doesn't retry, or `attempt_number` has already
+    reached this outcome's cap.
+    """
+    config = _load_retry_policy()
+    if not config.get("enabled", False):
+        return None
+    policy = config.get("outcomes", {}).get(outcome)
+    if policy is None or attempt_number >= policy["max_attempts"]:
+        return None
+    return time.time() + policy["delay_minutes"] * 60
+
+
+@dataclass(frozen=True)
+class OutboundCall:
+    phone_number: str
+    call_type: str | None  # one of OUTBOUND_CALL_TYPES, or None for a plain call
+    detail: (
+        str | None
+    )  # e.g. "your evening metformin dose" — not used for triage_followup
+    attempt_number: (
+        int  # 1 for a fresh call; >1 for a retry (see scripts/retry_outbound_calls.py)
+    )
+
+
+def _extract_outbound_call(job_metadata: str) -> OutboundCall | None:
+    """A job is an outbound call if its dispatch metadata carries a
+    `phone_number` (see scripts/make_outbound_call.py). Anything else —
+    empty, malformed, or without that key — is treated as a normal inbound
+    call, never as an error. An unrecognized `call_type` is treated the same
+    as no call_type (falls back to the plain generic-greeting flow) rather
+    than failing the call outright.
+    """
+    if not job_metadata:
+        return None
+    try:
+        data = json.loads(job_metadata)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    phone_number = data.get("phone_number")
+    if not isinstance(phone_number, str) or not phone_number.strip():
+        return None
+
+    call_type = data.get("call_type")
+    if call_type not in OUTBOUND_CALL_TYPES:
+        call_type = None
+
+    detail = data.get("detail")
+    detail = detail if isinstance(detail, str) and detail.strip() else None
+
+    attempt_number = data.get("attempt_number")
+    attempt_number = (
+        attempt_number if isinstance(attempt_number, int) and attempt_number > 0 else 1
+    )
+
+    return OutboundCall(
+        phone_number=phone_number,
+        call_type=call_type,
+        detail=detail,
+        attempt_number=attempt_number,
+    )
+
+
+async def _dial_outbound_participant(ctx: JobContext, phone_number: str) -> str:
+    """Places the outbound call over the Twilio SIP trunk and blocks until
+    the callee answers. Returns the outcome ("answered", "no_answer",
+    "busy", or "failed") — never raises — so a failed dial ends the job
+    cleanly instead of crashing it or trying to talk to an empty room.
+    """
+    trunk_id = os.environ.get("LIVEKIT_SIP_OUTBOUND_TRUNK_ID")
+    if not trunk_id:
+        logger.error(
+            "Cannot place outbound call to %s — LIVEKIT_SIP_OUTBOUND_TRUNK_ID is not "
+            "set (see scripts/setup_outbound_trunk.py)",
+            phone_number,
+        )
+        return "failed"
+
+    try:
+        await ctx.api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                room_name=ctx.room.name,
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone_number,
+                participant_identity=f"phone_{phone_number.lstrip('+')}",
+                participant_name="Caller",
+                # Block here until the call is actually answered, rather
+                # than speaking the opening greeting to a ringing line.
+                wait_until_answered=True,
+                ringing_timeout=Duration(
+                    seconds=int(
+                        os.environ.get("OUTBOUND_RINGING_TIMEOUT_SECONDS", "30")
+                    )
+                ),
+                max_call_duration=Duration(
+                    seconds=int(
+                        os.environ.get("OUTBOUND_MAX_CALL_DURATION_SECONDS", "1800")
+                    )
+                ),
+            )
+        )
+        return "answered"
+    except api.TwirpError as e:
+        outcome = _classify_sip_error(e)
+        logger.warning(
+            "Outbound call to %s did not connect (%s): %s", phone_number, outcome, e
+        )
+        return outcome
+
+
 server = AgentServer()
 
 
@@ -513,6 +824,26 @@ async def my_agent(ctx: JobContext):
     @session.on("close")
     def _on_close(event):
         db.end_call_session(db_session_id, event.reason.value)
+        # For an outbound call that actually connected, this is where we
+        # find out how it ended — persist the final outcome + retry
+        # schedule now that we know it. (Dial-time failures — no_answer /
+        # busy / failed before anyone answered — are recorded directly in
+        # the outbound branch below instead, since there's no session to
+        # close in that case.)
+        if (
+            assistant.outbound_call is not None
+            and assistant.outbound_outcome is not None
+        ):
+            call = assistant.outbound_call
+            outcome = assistant.outbound_outcome
+            db.record_outbound_attempt(
+                phone_number=call.phone_number,
+                call_type=call.call_type,
+                detail=call.detail,
+                attempt_number=call.attempt_number,
+                outcome=outcome,
+                next_retry_at=next_retry_at(outcome, call.attempt_number),
+            )
 
     # `metrics_collected` fires from a sync callback, so publishing has to be
     # scheduled as a background task — this set holds a strong reference to
@@ -574,6 +905,7 @@ async def my_agent(ctx: JobContext):
     # Start the session, which initializes the voice pipeline and warms up the models
     assistant = Assistant()
     assistant.room = ctx.room
+    assistant.job_ctx = ctx
     await session.start(
         agent=assistant,
         room=ctx.room,
@@ -603,9 +935,80 @@ async def my_agent(ctx: JobContext):
     # Join the room and connect to the user
     await ctx.connect()
 
+    # Outbound calls (see scripts/make_outbound_call.py) carry the target
+    # phone number — and optionally a purposeful reason to be calling, e.g.
+    # a medication/vaccination reminder or a triage follow-up — in the
+    # job's dispatch metadata, instead of already having a caller in the
+    # room. Dial out and wait for them to answer before falling into a
+    # greeting flow.
+    outbound_call = _extract_outbound_call(ctx.job.metadata)
+    if outbound_call is not None:
+        dial_outcome = await _dial_outbound_participant(ctx, outbound_call.phone_number)
+        if dial_outcome != "answered":
+            # Never answered — no_answer / busy / failed. No session to
+            # close, no conversation happened, so record the outcome
+            # directly here rather than via _on_close.
+            db.record_outbound_attempt(
+                phone_number=outbound_call.phone_number,
+                call_type=outbound_call.call_type,
+                detail=outbound_call.detail,
+                attempt_number=outbound_call.attempt_number,
+                outcome=dial_outcome,
+                next_retry_at=next_retry_at(dial_outcome, outbound_call.attempt_number),
+            )
+            db.end_call_session(db_session_id, f"outbound_{dial_outcome}")
+            return
+
+        # Answered — default outcome unless the disconnect handler below or
+        # report_voicemail_detected() overrides it before the call ends.
+        assistant.outbound_call = outbound_call
+        assistant.outbound_outcome = "answered"
+        answered_at = time.time()
+
+        def _on_sip_participant_disconnected(
+            participant: rtc.RemoteParticipant,
+        ) -> None:
+            if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                return
+            # If we hung up ourselves (end_call already ran) or the outcome
+            # was already classified some other way (e.g. voicemail), this
+            # disconnect is expected — leave the outcome as-is.
+            if assistant.agent_ended_call or assistant.outbound_outcome != "answered":
+                return
+            if time.time() - answered_at < IMMEDIATE_HANGUP_THRESHOLD_SECONDS:
+                assistant.outbound_outcome = "immediate_hangup"
+
+        ctx.room.on("participant_disconnected", _on_sip_participant_disconnected)
+
+    if outbound_call is not None and outbound_call.call_type is not None:
+        # Purposeful outbound call: skip the generic inbound-style greeting
+        # entirely and open with the actual reason for calling instead (see
+        # the OUTBOUND CALLS section of SYSTEM_PROMPT). The callee just
+        # answered their phone, so there's no "dead air while ringing" to
+        # avoid here the way there is for the inbound generic lead below —
+        # awaiting the lookup directly (instead of backgrounding it) is fine.
+        for participant in ctx.room.remote_participants.values():
+            _link_caller(participant)
+            break
+        lookup_result = await assistant.lookup_caller(None)
+        await session.generate_reply(
+            instructions=(
+                f"This is an outbound call YOU are placing — call_type="
+                f"{outbound_call.call_type!r}, detail={outbound_call.detail!r}. "
+                f"Caller profile lookup: {lookup_result}. "
+                "Open the call per the OUTBOUND CALLS section of your "
+                "instructions for this call_type. Do not call lookup_caller "
+                "again for this."
+            ),
+            allow_interruptions=False,
+        )
+        return
+
     # Kick off the caller lookup as soon as we know who's calling, but don't
     # wait on it yet — it runs in the background, concurrently with the
-    # opening line below, instead of delaying the start of the call.
+    # opening line below, instead of delaying the start of the call. Covers
+    # both inbound calls and a plain outbound call (phone_number only, no
+    # call_type) — from here on those two are identical.
     lookup_task: asyncio.Task[str] | None = None
     for participant in ctx.room.remote_participants.values():
         _link_caller(participant)

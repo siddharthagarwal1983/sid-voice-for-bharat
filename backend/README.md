@@ -216,6 +216,94 @@ Both tools publish their structured result (not just spoken text) to the room vi
 
 `agent.py`'s `metrics_collected` handler publishes STT/TTS pipeline latency the same way, on topic `"healthmitra-metrics"` — EOU transcription delay for "how long until it heard you," TTS time-to-first-byte for "how long until it started speaking." The frontend shows both live in `frontend/components/app/metrics-panel.tsx`, bottom-left of the page.
 
+## Outbound calling
+
+HealthMitra can place outbound calls — e.g. a proactive check-in — through a Twilio SIP trunk, in addition to answering inbound calls.
+
+### One-time setup
+
+1. Fill in the `TWILIO_*` variables in `.env.local` (Elastic SIP Trunking → your trunk → **Termination** for `TWILIO_SIP_TERM_URI`, **Credential Lists** for the SIP username/password).
+2. Create the LiveKit outbound trunk that routes through it:
+   ```bash
+   uv run python scripts/setup_outbound_trunk.py
+   ```
+   This prints a trunk ID (`ST_...`) — paste it into `.env.local` as `LIVEKIT_SIP_OUTBOUND_TRUNK_ID`. Re-running the script always creates a new trunk, so don't run it twice without checking `LiveKitAPI().sip.list_outbound_trunk()` first.
+
+### Placing a call
+
+With the worker running (`uv run python src/agent.py dev`):
+
+```bash
+uv run python scripts/make_outbound_call.py +9198XXXXXXXX
+```
+
+This dispatches `my-agent` into a fresh room with the phone number in the job's dispatch metadata (`{"phone_number": "+91..."}`). `my_agent()` in `agent.py` reads that metadata (`_extract_outbound_call`), dials out over the trunk and blocks until answered (`_dial_outbound_participant`, `wait_until_answered=True`), then falls into the exact same caller-lookup-and-greeting flow as an inbound call — from the agent's perspective, an answered plain outbound call looks identical to an inbound one from that point on. If the call isn't answered, the job ends cleanly (logged, no crash, no attempt to talk to an empty room).
+
+Note this places a real call and may incur Twilio charges — there's no simulated/dry-run mode.
+
+### Purposeful calls — reminders & follow-ups
+
+Pass `--type` to open with an actual reason for calling instead of the generic greeting (see the `OUTBOUND CALLS` section of `SYSTEM_PROMPT`):
+
+```bash
+# Medication / vaccination reminders — --detail says what to remind them about
+uv run python scripts/make_outbound_call.py +9198XXXXXXXX \
+  --type medication_reminder --detail "your evening metformin dose"
+
+uv run python scripts/make_outbound_call.py +9198XXXXXXXX \
+  --type vaccination_reminder --detail "your second flu vaccine dose, due this week"
+
+# Follow-up after a triage escalation — no --detail needed
+uv run python scripts/make_outbound_call.py +9198XXXXXXXX --type triage_followup
+```
+
+`triage_followup` doesn't take a `--detail` — it pulls `last_triage_outcome` from the caller's saved profile (the same one `save_caller_profile` writes to during any call, keyed by phone number) and has the agent reference it naturally — e.g. "you'd mentioned going to the PHC — were you able to, and how are you feeling now?" If nothing is on file for that number, the agent just asks generally how they've been since the last conversation instead of inventing a reason.
+
+An unrecognized or omitted `--type` falls back to the plain generic-greeting call above — this is a graceful default, not an error.
+
+### Call outcomes & retries
+
+Inbound calls only have one shape — the caller reached you. Outbound calls have several ways to *not* reach a live conversation, each handled differently:
+
+| Outcome | Detected | Behavior | Retry (when enabled) |
+| --- | --- | --- | --- |
+| `no_answer` | SIP timeout (408/480/487), or LiveKit's own `ringing_timeout` cancellation — see below | Job ends immediately, nothing spoken | 30 min later, up to 3 attempts |
+| `busy` | SIP busy (486/600/603) from the dial itself | Job ends immediately, nothing spoken | 10 min later, up to 3 attempts |
+| `voicemail` | The LLM recognizes an answering-machine greeting after the opening line (`report_voicemail_detected` tool) — there's no SIP-level or platform AMD signal available over raw SIP trunking, so this is a judgment call, same as any other tool | Leaves one short, call_type-appropriate message, then hangs up | 4 hours later, up to 2 attempts |
+| `immediate_hangup` | The SIP participant disconnects within 8s of answering, without the agent having called `end_call` itself | Job ends, nothing more said | 1 day later, up to 2 attempts (don't be pushy about a likely rejection) |
+| `failed` | Anything else — invalid number, no trunk configured, carrier/account error | Job ends immediately | None — needs a human to look at it, not an automatic retry |
+| `answered` | Connected, no special case triggered | Normal conversation, ends via `end_call` | None — it worked |
+
+Classification is built on **two** real errors captured from this project's own LiveKit SIP trunk, not just one — worth knowing since they look different:
+- A call the far end actively rejects carries a real SIP status in `TwirpError.metadata['sip_status_code']` (e.g. a carrier/account rejection).
+- A call that just **rings out** — nobody answers before `ringing_timeout` — raises `TwirpError(code="canceled", message="...sip request timed out...")` with **no `sip_status_code` in metadata at all**, since LiveKit cancels client-side rather than forwarding a status the far end never sent. Classifying on metadata alone missed this entirely and silently mislabeled every ring-timeout as `failed` — caught by placing a real no-answer test call, not by reading the docs. See `_classify_sip_error` in `agent.py`.
+
+`immediate_hangup` is a plain `participant_disconnected` timer check. Every outcome is logged to the `outbound_call_attempts` table (`db.py`) via `db.record_outbound_attempt`.
+
+#### Retry rules live in `config/retry_policy.json`, not in code
+
+```json
+{
+  "enabled": false,
+  "outcomes": {
+    "no_answer": { "max_attempts": 3, "delay_minutes": 30 },
+    "busy": { "max_attempts": 3, "delay_minutes": 10 },
+    "voicemail": { "max_attempts": 2, "delay_minutes": 240 },
+    "immediate_hangup": { "max_attempts": 2, "delay_minutes": 1440 }
+  }
+}
+```
+
+`agent.py`'s `next_retry_at()` re-reads this file on every retry decision (not cached at import), so changing a delay or attempt cap takes effect on the next outbound call without restarting the worker. The top-level `"enabled"` flag is a single master on/off switch for all outbound retries — it's currently **`false`**: outcomes are still classified and recorded normally, nothing just gets automatically retried yet. Flip it to `true` when you're ready to turn retries on.
+
+Retries are never executed inline in the job that hit the outcome — they're queued and picked up by a separate pass:
+
+```bash
+uv run python scripts/retry_outbound_calls.py
+```
+
+This queries `db.due_outbound_retries()` for attempts whose delay has elapsed, re-dispatches each one with `attempt_number` incremented (so the policy's `max_attempts` cap is respected), and marks it retried so it's never picked up twice. Run this periodically — e.g. on a cron schedule — it does one pass and exits rather than running as its own scheduler. While `"enabled": false`, it prints a clear message and exits immediately instead of silently doing nothing.
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):
@@ -256,6 +344,12 @@ docker run --env-file .env.local murf-voice-agent
 backend/
 ├── src/
 │   └── agent.py          # Agent entrypoint — pipeline, prompt, config
+├── config/
+│   └── retry_policy.json # Outbound retry delays/attempt caps + on/off switch
+├── scripts/
+│   ├── setup_outbound_trunk.py   # One-time: create the Twilio outbound SIP trunk
+│   ├── make_outbound_call.py     # Place an outbound call
+│   └── retry_outbound_calls.py   # Re-dispatch due outbound retries (run periodically)
 ├── tests/
 │   └── test_agent.py     # LLM-judged eval suite
 ├── .env.example           # Environment variable template

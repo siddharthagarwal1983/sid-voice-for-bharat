@@ -1,3 +1,4 @@
+import type { Metadata } from 'next';
 import { Public_Sans } from 'next/font/google';
 import localFont from 'next/font/local';
 import { headers } from 'next/headers';
@@ -43,6 +44,17 @@ const commitMono = localFont({
 interface RootLayoutProps {
   children: React.ReactNode;
 }
+
+// Only metadataBase — title/description are set dynamically per-request in
+// the JSX below (they depend on appConfig, which is resolved from request
+// headers for sandbox/multi-tenant support). metadataBase itself is static,
+// and is needed so opengraph-image resolves to an absolute URL in
+// production instead of defaulting to localhost.
+export const metadata: Metadata = {
+  metadataBase: new URL(
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000'
+  ),
+};
 
 export default async function RootLayout({ children }: RootLayoutProps) {
   const hdrs = await headers();
