@@ -304,6 +304,47 @@ uv run python scripts/retry_outbound_calls.py
 
 This queries `db.due_outbound_retries()` for attempts whose delay has elapsed, re-dispatches each one with `attempt_number` incremented (so the policy's `max_attempts` cap is respected), and marks it retried so it's never picked up twice. Run this periodically — e.g. on a cron schedule — it does one pass and exits rather than running as its own scheduler. While `"enabled": false`, it prints a clear message and exits immediately instead of silently doing nothing.
 
+## Human escalation
+
+HealthMitra knows when to stop and hand off to a person instead of trying to solve everything itself. See [`src/escalation.py`](src/escalation.py) (redaction, reasons, urgency, delivery) and the `create_escalation` tool + `HUMAN ESCALATION` section of `SYSTEM_PROMPT` in [`src/agent.py`](src/agent.py).
+
+### When it escalates
+
+Only two situations, both defined in `escalation.ESCALATION_REASONS`:
+
+1. **`red_flag_symptom`** — the caller has a red-flag/emergency symptom (already triggers the Escalation Script) or asks the agent to diagnose them / name a medicine (a Hard Refusal). The 108/hospital guidance or the "I can't name a medication" line is always said first — the escalation ticket is in addition to that, not instead of it.
+2. **`unresolved_request`** — a relevant tool (`search_knowledge_base`, `find_nearby_health_facility`) genuinely found nothing, or the caller directly asks for a human.
+
+It does **not** escalate for routine questions it already answered, or mild/home_care triage — see `test_mild_symptoms_do_not_trigger_escalation` in `tests/test_agent.py`.
+
+### Consent, every time
+
+Exactly like Day 4's `save_caller_profile`, `create_escalation` refuses to persist anything unless `consent_given=True` — and the system prompt requires the agent to tell the caller what it wants to send (a short summary, what was already checked, urgency, language, follow-up preference) and get clear agreement first. No password, OTP, PIN, or account number is ever meant to go into the summary; `escalation.redact()` is a second, code-level backstop that strips 6+ digit runs and sensitive-keyword values from `what_happened`/`already_checked` regardless of what the prompt catches.
+
+### Urgency, dedup, and status
+
+Every request gets `urgency` (`low`/`medium`/`high`/`emergency`) and a `status` (`open` → `in_progress` → `resolved`). If the same caller already has an open request for the same reason, `create_escalation` updates it (bumping urgency if the new report is more urgent, never lowering it) instead of opening a duplicate — see `db.find_open_escalation` / `db.bump_existing_escalation`.
+
+### Where it goes
+
+Every request is a real row in the same SQLite database (`data/agent.db`) the rest of the backend uses — always available with zero configuration. View and resolve open requests at:
+
+```bash
+uv run python scripts/escalation_dashboard.py
+```
+
+then open `http://localhost:8000`. If `ESCALATION_WEBHOOK_URL` is also set in `.env.local`, each request is additionally POSTed there (best-effort — a flaky webhook never breaks the call or loses the already-saved request). The payload's `text`/`content` fields work as-is with a Slack Incoming Webhook or a Discord webhook URL with `/slack` appended.
+
+### Callback after resolution
+
+Marking a request resolved in the dashboard (with an optional resolution note) makes it eligible for a Day-6 outbound callback:
+
+```bash
+uv run python scripts/escalation_followup_calls.py
+```
+
+Same one-pass-and-exit pattern as `scripts/retry_outbound_calls.py` — run it periodically. It finds resolved requests where the caller id looks like a phone number (`db.due_escalation_callbacks()`) and dispatches a `call_type="escalation_followup"` outbound call, which references the resolution note per the `OUTBOUND CALLS` section of `SYSTEM_PROMPT`, then marks it called-back so it's never dialed twice.
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):
@@ -343,13 +384,16 @@ docker run --env-file .env.local murf-voice-agent
 ```
 backend/
 ├── src/
-│   └── agent.py          # Agent entrypoint — pipeline, prompt, config
+│   ├── agent.py          # Agent entrypoint — pipeline, prompt, config
+│   └── escalation.py     # Human-escalation reasons, urgency, redaction, webhook delivery
 ├── config/
 │   └── retry_policy.json # Outbound retry delays/attempt caps + on/off switch
 ├── scripts/
-│   ├── setup_outbound_trunk.py   # One-time: create the Twilio outbound SIP trunk
-│   ├── make_outbound_call.py     # Place an outbound call
-│   └── retry_outbound_calls.py   # Re-dispatch due outbound retries (run periodically)
+│   ├── setup_outbound_trunk.py       # One-time: create the Twilio outbound SIP trunk
+│   ├── make_outbound_call.py         # Place an outbound call
+│   ├── retry_outbound_calls.py       # Re-dispatch due outbound retries (run periodically)
+│   ├── escalation_dashboard.py       # Local dashboard for open/resolved human-escalation requests
+│   └── escalation_followup_calls.py  # Callback resolved escalations (run periodically)
 ├── tests/
 │   └── test_agent.py     # LLM-judged eval suite
 ├── .env.example           # Environment variable template

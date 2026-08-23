@@ -90,6 +90,42 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_outbound_attempts_retry "
             "ON outbound_call_attempts(next_retry_at, retried)"
         )
+        # Human-escalation requests (see src/escalation.py and the HUMAN
+        # ESCALATION section of agent.py's SYSTEM_PROMPT). `reason` is one of
+        # the two escalation categories (escalation.ESCALATION_REASONS);
+        # `urgency` is low/medium/high/emergency; `status` is
+        # open/in_progress/resolved. `who`/`what_happened`/`already_checked`
+        # are short, redacted summaries only — never a full transcript or
+        # sensitive identifiers (see escalation.redact). `called_back` tracks
+        # whether scripts/escalation_followup_calls.py has already placed the
+        # Day-6 outbound callback for a resolved request, so it's never
+        # placed twice.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS escalations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                reason TEXT NOT NULL,
+                urgency TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                who TEXT,
+                what_happened TEXT NOT NULL,
+                already_checked TEXT,
+                language TEXT,
+                preferred_contact TEXT,
+                notify_status TEXT,
+                resolution_note TEXT,
+                called_back INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                resolved_at REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_escalations_user_reason "
+            "ON escalations(user_id, reason, status)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -285,6 +321,222 @@ def mark_outbound_retried(attempt_id: str) -> None:
         conn.execute(
             "UPDATE outbound_call_attempts SET retried = 1 WHERE id = ?",
             (attempt_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Human escalation requests (see src/escalation.py)
+# ---------------------------------------------------------------------------
+
+# Short, speakable-over-the-phone reference id — e.g. "A1B2C3D4" — rather
+# than a full uuid4, since the agent has to read this out loud and the
+# caller may need to repeat it back to a human later.
+_ESCALATION_ID_LEN = 8
+
+_URGENCY_RANK = {"low": 0, "medium": 1, "high": 2, "emergency": 3}
+
+
+def _new_escalation_id() -> str:
+    return uuid.uuid4().hex[:_ESCALATION_ID_LEN].upper()
+
+
+def find_open_escalation(user_id: str, reason: str) -> dict | None:
+    """An existing not-yet-resolved request for this caller and reason, if
+    any — used to dedupe instead of opening a second ticket for the same
+    problem. Returns None if `user_id` is falsy (nothing to dedupe against
+    for an unidentified caller).
+    """
+    if not user_id:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM escalations
+            WHERE user_id = ? AND reason = ? AND status != 'resolved'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (user_id, reason),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def create_escalation(
+    *,
+    user_id: str | None,
+    reason: str,
+    urgency: str,
+    who: str | None,
+    what_happened: str,
+    already_checked: str | None,
+    language: str | None,
+    preferred_contact: str | None,
+    notify_status: str,
+) -> dict:
+    """Open a new escalation request. Returns the created row (including its
+    short `id`, which is what the caller is told as their reference)."""
+    escalation_id = _new_escalation_id()
+    now = time.time()
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO escalations
+                (id, user_id, reason, urgency, status, who, what_happened,
+                 already_checked, language, preferred_contact, notify_status,
+                 called_back, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                escalation_id,
+                user_id,
+                reason,
+                urgency,
+                who,
+                what_happened,
+                already_checked,
+                language,
+                preferred_contact,
+                notify_status,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_escalation(escalation_id)
+
+
+def bump_existing_escalation(
+    escalation_id: str, *, urgency: str, additional_note: str
+) -> dict:
+    """Update an already-open escalation instead of creating a duplicate —
+    raises its urgency if the new report is more urgent than what's on file,
+    and appends a short note so a human reviewing it can see both reports.
+    Never lowers urgency or overwrites the original `what_happened`.
+    """
+    existing = get_escalation(escalation_id)
+    new_urgency = (
+        urgency
+        if _URGENCY_RANK.get(urgency, 0) > _URGENCY_RANK.get(existing["urgency"], 0)
+        else existing["urgency"]
+    )
+    merged_note = f"{existing['what_happened']}\n[update] {additional_note}"
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE escalations
+            SET urgency = ?, what_happened = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_urgency, merged_note, time.time(), escalation_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_escalation(escalation_id)
+
+
+def get_escalation(escalation_id: str) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM escalations WHERE id = ?", (escalation_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_escalations(status: str | None = None) -> list[dict]:
+    """All escalations, newest first. Pass `status` to filter to one of
+    open/in_progress/resolved; omit for all of them. Backs
+    scripts/escalation_dashboard.py.
+    """
+    conn = get_connection()
+    try:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM escalations WHERE status = ? ORDER BY created_at DESC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM escalations ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_escalation_status(
+    escalation_id: str, status: str, resolution_note: str | None = None
+) -> None:
+    """Move a request through open -> in_progress -> resolved. Sets
+    `resolved_at` the moment it becomes resolved (used by
+    scripts/escalation_followup_calls.py to find requests ready for a
+    callback)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE escalations
+            SET status = ?, resolution_note = COALESCE(?, resolution_note),
+                resolved_at = CASE WHEN ? = 'resolved' THEN ? ELSE resolved_at END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (status, resolution_note, status, time.time(), time.time(), escalation_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def due_escalation_callbacks() -> list[dict]:
+    """Resolved requests for a phone-number caller that haven't had their
+    Day-6 outbound callback placed yet. Consumed by
+    scripts/escalation_followup_calls.py.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM escalations
+            WHERE status = 'resolved' AND called_back = 0
+                AND user_id IS NOT NULL AND user_id LIKE '+%'
+            ORDER BY resolved_at ASC
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_escalation_notify_status(escalation_id: str, notify_status: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE escalations SET notify_status = ? WHERE id = ?",
+            (notify_status, escalation_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_escalation_called_back(escalation_id: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE escalations SET called_back = 1 WHERE id = ?", (escalation_id,)
         )
         conn.commit()
     finally:

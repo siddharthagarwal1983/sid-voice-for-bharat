@@ -25,6 +25,7 @@ from livekit.plugins import deepgram, google, murf, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import db
+import escalation
 import health_tools
 import knowledge_base
 
@@ -107,6 +108,26 @@ FACILITY LOOKUP
 
 When the caller asks where to go, wants an address, or you've just told them to visit a PHC/hospital, call find_nearby_health_facility. Reuse a district you already have — from earlier in this call, or from lookup_caller's saved profile — without asking again; only ask the caller for their district/city if you genuinely don't have it from any source yet. Speak the facility names and areas naturally in 1-2 short sentences, never as a read-out list, and always mention in your own words whether this is fresh information or from a saved reference list. If it finds nothing for their area, say so plainly and point them to the 104 health helpline or their local ASHA worker — never invent a facility name or address.
 
+HUMAN ESCALATION
+
+You cannot solve everything yourself. Some situations need a human to look at them — that's what create_escalation is for. It does NOT replace anything else in these instructions; it happens IN ADDITION to your normal spoken response.
+
+When to escalate — only these two situations:
+1. Red-flag / diagnosis situations: the caller has a red-flag symptom that triggers the Escalation Script below, OR the caller asks you to diagnose them or name a specific medicine (a Hard Refusal). In both cases, first give the required spoken response (the 108/hospital line, or the "I can't name a medication" deflection) — that already-scripted line is the safety-critical part and always comes first, regardless of whether an escalation ticket ever gets created. Then, once you've said it, offer to also log a request so a human reviews the situation.
+2. Genuinely unresolved requests: you tried the relevant tool (search_knowledge_base, find_nearby_health_facility) and it found nothing useful, OR the caller directly asks to speak to a real person / human, and you have no way to satisfy that yourself.
+
+Do NOT escalate for routine questions you already answered, mild/home_care triage, or just because a caller sounds mildly unsatisfied — this is for the two situations above only, not a catch-all.
+
+Ask before sharing (CRITICAL, NON-NEGOTIABLE): Before ever calling create_escalation, tell the caller in plain words, in whichever language you're currently speaking, what you want to send to a human — a short summary of what happened, what you already checked, how urgent it seems, their language, and how they'd like to be followed up with (e.g. a callback on this number, or SMS) — and ask their permission. Only call create_escalation with consent_given=True if they clearly agree, exactly like the Consent Before Saving rule for save_caller_profile. If they say no, do not call it — say that's fine and keep helping however you still can.
+
+What NOT to send: never put a password, OTP, PIN, account number, card number, or any other sensitive identifier into what_happened or already_checked — describe the situation qualitatively (e.g. "caller has chest pain and breathlessness" or "caller asked about PM-JAY coverage, not found in knowledge base") rather than repeating back anything sensitive they said. Do not send the full conversation — only this short summary.
+
+Urgency: pass urgency="emergency" for anything matching the Escalation Script red-flags; "high" for a pregnant/infant case or a diagnosis request that's clearly urgent to the caller; "medium" for an unresolved request with real impact (e.g. a scheme the caller needs soon); "low" for a general "would be good for a human to double check" case.
+
+After it returns: tell the caller their reference id exactly as given (they may need to repeat it to a human later), that the request is now open, and an honest next step — a member of the human support team will review it. Say only that it will be REVIEWED, never that they WILL be contacted, called back, or replied to by a specific time — you don't actually know that a callback will happen, only that a human will look at it. If they ask when, say you don't have an exact timeframe. If the tool tells you a similar request was already open and this one just updated it, say that instead of implying a brand-new one was created.
+
+Updating a request already opened THIS call (CRITICAL): If, after you've already created a request this call, the caller says something that should change its urgency or details (e.g. "please call me immediately", or they describe a worse symptom) — call create_escalation AGAIN with the updated urgency/what_happened. Calling it again with the same reason updates the existing request rather than duplicating it. NEVER tell the caller their request's urgency, priority, or details changed unless you actually called create_escalation again and its result confirms the update (it will say UPDATED and state the new urgency) — do not just say "noted as high priority" or similar from memory. If you're not going to call the tool again, don't claim anything changed; instead say plainly that you don't have a way to guarantee an immediate callback, exactly as usual.
+
 OUTBOUND CALLS (proactive reminders & follow-ups)
 
 Most calls are inbound — the caller reached you. Some calls are ones YOU are placing (see backend/scripts/make_outbound_call.py) for a specific reason. For these, your instructions for the very first thing you say will tell you the call_type and any detail, plus the caller profile lookup already run for you — don't call lookup_caller again for this. Outbound calls always open differently from inbound: the person didn't choose to call, so identify yourself and the reason for calling immediately, in 1-2 sentences, before anything else. Always in English first, per the Default Language rule.
@@ -117,6 +138,8 @@ Most calls are inbound — the caller reached you. Some calls are ones YOU are p
 
 - call_type="triage_followup": You're calling to check in after a PREVIOUS call where you routed this caller somewhere. Introduce yourself, then reference their last_triage_outcome from the caller profile lookup in your own natural words — never read it verbatim — and ask how it went or how they're feeling now. Example, if last_triage_outcome was "advised PHC visit": "Hi, this is HealthMitra — I'm calling to follow up on our last conversation. You'd mentioned going to the PHC — were you able to, and how are you feeling now?" If there's no last_triage_outcome on file, ask generally how they've been feeling since you last spoke instead of referencing anything specific.
 
+- call_type="escalation_followup": You're calling because a human-escalation request you created on a previous call (see HUMAN ESCALATION above) has now been marked resolved. The given detail describes what the request was about and how it was resolved — introduce yourself, mention in your own words that a human has looked into what they'd raised, and reference the detail naturally, then ask if they have any remaining questions. Example: "Hi, this is HealthMitra — I'm calling to follow up on the request you raised with us. [reference detail naturally] — does that resolve it for you, or is there anything else I can help with?"
+
 Whichever type it is, once you've delivered the reason for calling and gotten a response, the rest of the call proceeds exactly like any other — same tools, same Default Language rule, same guardrails — and call end_call per the Ending the Call rule below once it's naturally finished.
 
 Voicemail (CRITICAL): On an outbound call, what picks up isn't always a person. If what you hear after your opening line sounds like an answering machine or voicemail system — a scripted greeting inviting you to leave a message after a tone, mentioning a mailbox, saying the person is unavailable, or the Hindi equivalent (e.g. "कृपया संदेश छोड़ें", "अभी उपलब्ध नहीं है") — call report_voicemail_detected immediately. Then leave ONE short, appropriate message and hang up: for a medication/vaccination reminder, state the reminder briefly and say you'll try again later; for a triage follow-up, say you were checking in and you'll try again later. Do not try to have a conversation with a voicemail greeting, and do not wait through a long greeting before acting — as soon as you're confident it's not live, act. If you're not genuinely confident it's a machine, treat it as a person instead and continue normally — a real but slow or unusually-worded reply is not voicemail.
@@ -124,6 +147,8 @@ Voicemail (CRITICAL): On an outbound call, what picks up isn't always a person. 
 GUARDRAILS
 
 Consent Before Saving (CRITICAL, NON-NEGOTIABLE): You must NEVER call save_caller_profile without first asking the caller and having them clearly agree. This applies to every field — name, age band, ongoing conditions, triage outcome, language. No exceptions, no judgment calls, even if it seems obviously helpful to remember. If in doubt, don't save.
+
+Consent Before Escalating (CRITICAL, NON-NEGOTIABLE): You must NEVER call create_escalation without first telling the caller what you want to send and having them clearly agree, per HUMAN ESCALATION above. No exceptions.
 
 Hard Refusals (No Diagnosis & No Drugs): You must NEVER diagnose a condition or name a specific prescription drug. If a user asks what medicine to take, deflect smoothly in the current conversation language — English: "I'm an AI assistant and can't name specific medication. Please take what your doctor prescribed, or visit your nearest PHC." / Hindi: "मैं एक एआई असिस्टेंट हूँ और कोई दवा का नाम नहीं बता सकती। कृपया अपने डॉक्टर द्वारा बताई गई दवा लें या नजदीकी पीएचसी (PHC) जाएँ।" You may only mention basic, standard over-the-counter comforts (like ORS / ओआरएस).
 
@@ -177,6 +202,14 @@ class Assistant(Agent):
         # this cleanly" apart from "they hung up on us" — both fire the
         # same disconnect event.
         self.agent_ended_call = False
+        # Escalation ids created THIS call, keyed by reason (see
+        # create_escalation below). db.find_open_escalation can only dedupe
+        # by self.user_id, which is None/empty for a browser caller with no
+        # phone number — without this, a second create_escalation call in
+        # the same conversation would silently open a duplicate instead of
+        # updating the one just created. Reset per call since it's instance
+        # state, not persisted.
+        self.escalation_ids: dict[str, str] = {}
 
     @function_tool
     async def lookup_caller(self, context: RunContext) -> str:
@@ -481,6 +514,156 @@ class Assistant(Agent):
             "sentences — name the facility and area, don't read this out as a list."
         )
 
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        consent_given: bool,
+        reason: str,
+        urgency: str,
+        what_happened: str,
+        already_checked: str,
+        preferred_contact: str,
+    ) -> str:
+        """Hand this situation off to a human — see HUMAN ESCALATION in your
+        instructions for exactly when to call this and what to say first.
+        Only ever call this AFTER telling the caller what you plan to send
+        and getting their clear agreement.
+
+        HARD RULE: set consent_given=True only if the caller has just
+        clearly agreed, in this call, to you sending this summary to a
+        human. If they declined, or you haven't asked, do not call this
+        tool at all (or pass consent_given=False) — nothing is created or
+        sent unless consent_given is True.
+
+        If an open request already exists for this caller and reason —
+        including one you opened earlier in THIS SAME call — this updates
+        it (raising its urgency if this report is more urgent, and
+        appending your new note) instead of creating a duplicate. The
+        result tells you which happened (CREATED vs UPDATED) and the
+        request's actual current urgency — only tell the caller their
+        request's urgency or details changed if you called this tool again
+        and the result says UPDATED. Never claim a change you didn't
+        actually make by calling this tool.
+
+        Args:
+            consent_given: Whether the caller has explicitly agreed, in this
+                call, to you sending this summary to a human.
+            reason: Either "red_flag_symptom" (red-flag symptom or a
+                request for diagnosis/medication you can't give) or
+                "unresolved_request" (your tools couldn't resolve their
+                need, or they asked for a human directly).
+            urgency: One of "low", "medium", "high", "emergency" — see the
+                Urgency guidance in HUMAN ESCALATION.
+            what_happened: A short, plain-language summary of the situation
+                — e.g. "caller has chest pain and breathlessness for the
+                last hour". NEVER include a password, OTP, PIN, account
+                number, or other sensitive identifier — describe the
+                situation, don't repeat sensitive values back.
+            already_checked: A short summary of what you already did or
+                told them — e.g. "gave 108/hospital guidance per escalation
+                script" or "searched knowledge base, no PM-JAY info found
+                for this case". Same rule — no sensitive values.
+            preferred_contact: How the caller would like to be followed up
+                with, in their own words — e.g. "callback on this number",
+                "SMS is fine", "no preference". Do not write out a phone
+                number here — you already have their number from the call
+                itself if it's a phone call.
+        """
+        if not consent_given:
+            logger.info("create_escalation skipped — no caller consent")
+            return "Not created — caller consent is required before sending anything to a human."
+
+        if reason not in escalation.ESCALATION_REASONS:
+            return (
+                f"Invalid reason {reason!r} — must be one of "
+                f"{sorted(escalation.ESCALATION_REASONS)}. Not created."
+            )
+        if urgency not in escalation.URGENCY_LEVELS:
+            return (
+                f"Invalid urgency {urgency!r} — must be one of "
+                f"{escalation.URGENCY_LEVELS}. Not created."
+            )
+
+        who = "unidentified caller"
+        language = None
+        if self.user_id:
+            caller = await asyncio.to_thread(db.get_caller, self.user_id)
+            name = caller["name"] if caller else None
+            language = caller["language_preference"] if caller else None
+            # Only phone-shaped user ids (SIP calls) are meaningful contact
+            # info for a human to act on — a browser room identity isn't.
+            phone = self.user_id if self.user_id.startswith("+") else None
+            if name and phone:
+                who = f"{name} ({phone})"
+            elif name:
+                who = name
+            elif phone:
+                who = phone
+
+        clean_what_happened = escalation.redact(what_happened)
+        clean_already_checked = escalation.redact(already_checked)
+
+        # Prefer the request THIS call already opened for this reason, if
+        # any — this is what makes dedup work for a browser caller with no
+        # phone-number identity to key db.find_open_escalation off of.
+        # Only trust it if it's still open (it could in principle have been
+        # resolved mid-call via the dashboard).
+        existing = None
+        in_call_id = self.escalation_ids.get(reason)
+        if in_call_id:
+            candidate = await asyncio.to_thread(db.get_escalation, in_call_id)
+            if candidate and candidate["status"] != "resolved":
+                existing = candidate
+        if existing is None:
+            existing = await asyncio.to_thread(
+                db.find_open_escalation, self.user_id or "", reason
+            )
+        if existing:
+            record = await asyncio.to_thread(
+                db.bump_existing_escalation,
+                existing["id"],
+                urgency=urgency,
+                additional_note=clean_what_happened,
+            )
+            notify_status = await asyncio.to_thread(escalation.notify_webhook, record)
+            await asyncio.to_thread(
+                db.set_escalation_notify_status, record["id"], notify_status
+            )
+            self.escalation_ids[reason] = record["id"]
+            return (
+                f"UPDATED existing open request, reference_id={record['id']!r}, "
+                f"urgency={record['urgency']!r}, status={record['status']!r}, "
+                f"notify={notify_status!r}. Tell the caller this reference id and "
+                "that it updates a request already in progress for them, per "
+                "HUMAN ESCALATION — do not imply a brand-new request was made."
+            )
+
+        record = await asyncio.to_thread(
+            db.create_escalation,
+            user_id=self.user_id,
+            reason=reason,
+            urgency=urgency,
+            who=who,
+            what_happened=clean_what_happened,
+            already_checked=clean_already_checked,
+            language=language,
+            preferred_contact=preferred_contact,
+            notify_status="pending",
+        )
+        notify_status = await asyncio.to_thread(escalation.notify_webhook, record)
+        await asyncio.to_thread(
+            db.set_escalation_notify_status, record["id"], notify_status
+        )
+        self.escalation_ids[reason] = record["id"]
+        return (
+            f"CREATED, reference_id={record['id']!r}, urgency={urgency!r}, "
+            f"status='open', notify={notify_status!r}. Tell the caller this "
+            "reference id clearly and the honest next step per HUMAN "
+            "ESCALATION — a human will review it, don't promise a specific "
+            "reply time."
+        )
+
     # To add more tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
     # @function_tool
@@ -513,7 +696,12 @@ def resolve_caller_user_id(participant: rtc.RemoteParticipant) -> str:
 # generic-greeting behavior; these three open with the actual reason for
 # calling instead, per the OUTBOUND CALLS section of SYSTEM_PROMPT.
 OUTBOUND_CALL_TYPES = frozenset(
-    {"medication_reminder", "vaccination_reminder", "triage_followup"}
+    {
+        "medication_reminder",
+        "vaccination_reminder",
+        "triage_followup",
+        "escalation_followup",
+    }
 )
 
 # ---------------------------------------------------------------------------
