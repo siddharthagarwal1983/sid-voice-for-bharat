@@ -1,0 +1,6 @@
+{
+  "_comment": "Deterministic backstops for SYSTEM_PROMPT's 'Ending the Call' rule (see agent.py). The LLM is instructed to say a farewell and call end_call in the same turn, but that's a prompt-only guarantee, so my_agent()'s idle watchdog force-disconnects the room if it doesn't happen. Loaded fresh on every call (not cached), so editing this file takes effect on the next call without restarting the worker.",
+
+  "farewell_grace_seconds": 5.0,
+  "idle_hangup_timeout_seconds": 20.0
+}

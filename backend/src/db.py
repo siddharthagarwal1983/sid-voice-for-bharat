@@ -24,6 +24,16 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, coltype: str
+) -> None:
+    """Idempotent `ALTER TABLE ... ADD COLUMN` — safe to call every startup
+    even against a database created before this column existed."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def init_db() -> None:
     conn = get_connection()
     try:
@@ -39,6 +49,23 @@ def init_db() -> None:
             )
             """
         )
+        # Day-8 call-outcome tracking (see the "Call outcome tracking"
+        # section below and the CALL SUCCESS DEFINITION note in agent.py).
+        # Added via migration, not the CREATE TABLE above, so a database
+        # created by an earlier day's code still picks these up.
+        # `channel` is "browser" or "sip". `outcome` is "success" or
+        # "failed". `failure_category` is only set when outcome="failed":
+        # one of user_declined, incomplete, tool_failure, api_error,
+        # no_response, hangup. `track_outcome` is a short label for what
+        # was actually delivered, e.g. "triage:phc" or
+        # "escalation:red_flag_symptom:emergency" — never a full sentence,
+        # and never any caller-identifying or medical free text.
+        _ensure_column(conn, "call_sessions", "channel", "TEXT")
+        _ensure_column(conn, "call_sessions", "language", "TEXT")
+        _ensure_column(conn, "call_sessions", "outcome", "TEXT")
+        _ensure_column(conn, "call_sessions", "failure_category", "TEXT")
+        _ensure_column(conn, "call_sessions", "track_outcome", "TEXT")
+        _ensure_column(conn, "call_sessions", "avg_response_latency_ms", "REAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -125,6 +152,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_escalations_user_reason "
             "ON escalations(user_id, reason, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_call_sessions_outcome "
+            "ON call_sessions(outcome, started_at)"
         )
         conn.commit()
     finally:
@@ -539,5 +570,211 @@ def mark_escalation_called_back(escalation_id: str) -> None:
             "UPDATE escalations SET called_back = 1 WHERE id = ?", (escalation_id,)
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Day-8 call outcome tracking
+#
+# "Success" for HealthMitra (see the CALL SUCCESS DEFINITION note in
+# agent.py) means the caller received safe guidance (a symptom-triage
+# routing decision, or a scheme/eligibility answer from the knowledge base)
+# or an appropriate human escalation. agent.py's my_agent() figures out,
+# once a call ends, which of those happened (or why none did) and calls
+# record_call_outcome() exactly once per call. Everything here reads/writes
+# only call_sessions — never the messages table and never a caller's phone
+# number — so this data is always safe to show on a public-ish dashboard.
+# ---------------------------------------------------------------------------
+
+FAILURE_CATEGORIES = (
+    "user_declined",  # caller declined to continue / withheld consent for the
+    # thing that would have completed the call
+    "incomplete",  # call ended (agent said goodbye) without reaching a triage
+    # result, a successful escalation, or a resolved knowledge-base query
+    "tool_failure",  # a tool call raised an exception rather than returning
+    # a normal (possibly "not found") result
+    "api_error",  # the STT/LLM/TTS pipeline itself errored
+    "no_response",  # caller never said anything
+    "hangup",  # caller disconnected before the call reached a resolution
+)
+
+
+def record_call_outcome(
+    session_id: str,
+    *,
+    outcome: str,
+    failure_category: str | None,
+    track_outcome: str | None,
+    channel: str | None,
+    language: str | None,
+    avg_response_latency_ms: float | None,
+) -> None:
+    """Record the final outcome of one call. Called exactly once, from
+    agent.py's session "close" handler, after the call has actually ended.
+    `outcome` is "success" or "failed"; `failure_category` must be one of
+    FAILURE_CATEGORIES when outcome="failed", and should be None otherwise.
+    """
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE call_sessions
+            SET outcome = ?, failure_category = ?, track_outcome = ?,
+                channel = ?, language = ?, avg_response_latency_ms = ?
+            WHERE id = ?
+            """,
+            (
+                outcome,
+                failure_category,
+                track_outcome,
+                channel,
+                language,
+                avg_response_latency_ms,
+                session_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_dashboard_stats(
+    *,
+    date_from: float | None = None,
+    date_to: float | None = None,
+    channel: str | None = None,
+    language: str | None = None,
+) -> dict:
+    """Aggregate counts for the Day-8 dashboard. Only ever reads the small
+    set of outcome columns on call_sessions — never message content or
+    participant_identity (which can hold a caller's phone number).
+    """
+    clauses = ["outcome IS NOT NULL"]
+    params: list = []
+    if date_from is not None:
+        clauses.append("started_at >= ?")
+        params.append(date_from)
+    if date_to is not None:
+        clauses.append("started_at <= ?")
+        params.append(date_to)
+    if channel:
+        clauses.append("channel = ?")
+        params.append(channel)
+    if language:
+        clauses.append("language = ?")
+        params.append(language)
+    where = " AND ".join(clauses)
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT outcome, failure_category, track_outcome, started_at, "
+            f"avg_response_latency_ms FROM call_sessions WHERE {where}",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    total = len(rows)
+    successful = sum(1 for r in rows if r["outcome"] == "success")
+    failed = total - successful
+
+    failure_breakdown: dict[str, int] = {}
+    track_breakdown: dict[str, int] = {}
+    daily: dict[str, dict[str, int]] = {}
+    latencies: list[float] = []
+
+    for r in rows:
+        if r["outcome"] == "failed" and r["failure_category"]:
+            failure_breakdown[r["failure_category"]] = (
+                failure_breakdown.get(r["failure_category"], 0) + 1
+            )
+        if r["track_outcome"]:
+            track_breakdown[r["track_outcome"]] = (
+                track_breakdown.get(r["track_outcome"], 0) + 1
+            )
+        if r["avg_response_latency_ms"] is not None:
+            latencies.append(r["avg_response_latency_ms"])
+        day = time.strftime("%Y-%m-%d", time.localtime(r["started_at"]))
+        bucket = daily.setdefault(day, {"total": 0, "success": 0, "failed": 0})
+        bucket["total"] += 1
+        bucket["success" if r["outcome"] == "success" else "failed"] += 1
+
+    return {
+        "total_calls": total,
+        "successful_calls": successful,
+        "failed_calls": failed,
+        "success_rate": round(successful / total * 100, 1) if total else 0.0,
+        "failure_breakdown": failure_breakdown,
+        "track_breakdown": track_breakdown,
+        "daily": dict(sorted(daily.items())),
+        "avg_latency_ms": round(sum(latencies) / len(latencies), 0)
+        if latencies
+        else None,
+    }
+
+
+def list_recent_calls(
+    *,
+    limit: int = 50,
+    channel: str | None = None,
+    language: str | None = None,
+    outcome: str | None = None,
+) -> list[dict]:
+    """Recent calls for the dashboard's call-history table. Deliberately
+    selects only non-sensitive columns — no participant_identity (may be a
+    phone number), no room_name, and never joins the messages table, so a
+    full conversation transcript can never end up on this list.
+    """
+    clauses = ["outcome IS NOT NULL"]
+    params: list = []
+    if channel:
+        clauses.append("channel = ?")
+        params.append(channel)
+    if language:
+        clauses.append("language = ?")
+        params.append(language)
+    if outcome:
+        clauses.append("outcome = ?")
+        params.append(outcome)
+    where = " AND ".join(clauses)
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, started_at, ended_at, channel, language, outcome,
+                   failure_category, track_outcome, avg_response_latency_ms
+            FROM call_sessions
+            WHERE {where}
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_call_filter_options() -> dict:
+    """Distinct channel/language values actually present, so the dashboard's
+    filter dropdowns only ever offer choices with real data behind them."""
+    conn = get_connection()
+    try:
+        channels = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT channel FROM call_sessions WHERE channel IS NOT NULL ORDER BY channel"
+            ).fetchall()
+        ]
+        languages = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT language FROM call_sessions WHERE language IS NOT NULL ORDER BY language"
+            ).fetchall()
+        ]
+        return {"channels": channels, "languages": languages}
     finally:
         conn.close()

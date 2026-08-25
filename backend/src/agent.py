@@ -13,11 +13,13 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    CloseReason,
     JobContext,
     JobProcess,
     RunContext,
     cli,
     function_tool,
+    llm,
     room_io,
     tokenize,
 )
@@ -32,6 +34,23 @@ import knowledge_base
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+# ---------------------------------------------------------------------------
+# CALL SUCCESS DEFINITION (Day 8, Health Access track)
+#
+# A call is SUCCESSFUL if the caller received either:
+#   1. Safe guidance — a symptom-triage routing decision (classify_symptom_
+#      triage was called and returned a level), or a grounded scheme/
+#      eligibility answer (search_knowledge_base found a match), or
+#   2. An appropriate escalation — create_escalation succeeded (the caller
+#      consented and a request was created or updated).
+#
+# Anything else is a FAILED call — not necessarily a bug, just a call that
+# didn't reach the above. See db.FAILURE_CATEGORIES for how failures are
+# further broken down, and the close handler in my_agent() below for where
+# this decision is actually made, once per call, from what Assistant
+# recorded during the conversation.
+# ---------------------------------------------------------------------------
 
 db.init_db()
 knowledge_base.init_kb()
@@ -202,6 +221,11 @@ class Assistant(Agent):
         # this cleanly" apart from "they hung up on us" — both fire the
         # same disconnect event.
         self.agent_ended_call = False
+        # Mirrors my_agent()'s current_tts_locale, updated on every final
+        # STT transcript (see _on_user_input_transcribed) — "en" or "hi".
+        # end_call() below uses this to pick the language of the fallback
+        # farewell it speaks itself when the LLM's turn didn't include one.
+        self.current_language = "en"
         # Escalation ids created THIS call, keyed by reason (see
         # create_escalation below). db.find_open_escalation can only dedupe
         # by self.user_id, which is None/empty for a browser caller with no
@@ -210,6 +234,19 @@ class Assistant(Agent):
         # updating the one just created. Reset per call since it's instance
         # state, not persisted.
         self.escalation_ids: dict[str, str] = {}
+        # Day-8 call-outcome signals — see CALL SUCCESS DEFINITION below and
+        # the outcome-determination logic in my_agent()'s close handler.
+        # Populated by classify_symptom_triage / search_knowledge_base /
+        # create_escalation as the call actually happens; never written to
+        # directly from outside those tools.
+        self.triage_results: list[dict] = []
+        self.kb_hit = False
+        self.escalation_success: dict | None = None
+        self.escalation_consent_declined = False
+        # Set True only if a function tool raises rather than returning a
+        # normal result — see the function_tools_executed handler in
+        # my_agent(), which is the only thing that ever sets this.
+        self.tool_exception_occurred = False
 
     @function_tool
     async def lookup_caller(self, context: RunContext) -> str:
@@ -328,16 +365,44 @@ class Assistant(Agent):
 
         IMPORTANT ORDER: say your brief farewell line FIRST (in whatever
         language you're currently speaking), in the same turn, THEN call
-        this tool — never call it before you've said goodbye. This tool
-        itself doesn't speak anything; it waits for your farewell to finish
-        playing, then disconnects the call.
+        this tool — never call it before you've said goodbye. If you skip
+        the farewell, this tool speaks a generic one on your behalf before
+        hanging up, so don't rely on that as a substitute for your own
+        warmer, context-appropriate goodbye.
         """
-        # Let the farewell that was just generated finish playing before
-        # actually hanging up, so it isn't cut off mid-sentence. Must use
-        # RunContext.wait_for_playout() here, not the SpeechHandle's own —
-        # this tool call is itself part of that same speech handle, so
-        # waiting on the handle directly would be a circular self-wait.
-        await context.wait_for_playout()
+        # Deterministic backstop, not just a prompt instruction: confirmed
+        # live (2026-08-25) that the model can call this tool with NO
+        # accompanying text at all — no farewell, nothing — hanging up on
+        # the caller with total silence. Check what this turn's own
+        # assistant message(s) actually said; only trust wait_for_playout()
+        # (which lets an existing farewell finish playing) if one of them
+        # actually reads as a farewell. Otherwise speak a fallback ourselves
+        # first, so a goodbye is said on every single call — not just the
+        # ones where the model remembered to include one.
+        turn_text = "\n".join(
+            item.text_content or ""
+            for item in context.speech_handle.chat_items
+            if isinstance(item, llm.ChatMessage) and item.role == "assistant"
+        )
+        if _looks_like_farewell(turn_text):
+            # Let the farewell that was just generated finish playing before
+            # actually hanging up, so it isn't cut off mid-sentence. Must use
+            # RunContext.wait_for_playout() here, not the SpeechHandle's own —
+            # this tool call is itself part of that same speech handle, so
+            # waiting on the handle directly would be a circular self-wait.
+            await context.wait_for_playout()
+        else:
+            fallback = (
+                _FALLBACK_FAREWELL_HI
+                if self.current_language == "hi"
+                else _FALLBACK_FAREWELL_EN
+            )
+            logger.warning(
+                "end_call invoked with no farewell in this turn — speaking "
+                "fallback farewell (%r) before hanging up",
+                fallback,
+            )
+            await context.session.say(fallback)
 
         self.agent_ended_call = True
         if self.job_ctx is not None:
@@ -382,6 +447,7 @@ class Assistant(Agent):
         if not results:
             return "No matching information found in the knowledge base."
 
+        self.kb_hit = True
         return "\n\n".join(f"[{r['source']}] {r['text']}" for r in results)
 
     async def _publish_to_room(self, topic: str, payload: dict) -> None:
@@ -428,6 +494,7 @@ class Assistant(Agent):
         result = await asyncio.to_thread(
             health_tools.classify_triage, symptoms, language
         )
+        self.triage_results.append(result)
         await self._publish_to_room("healthmitra-triage", result)
 
         return (
@@ -572,6 +639,7 @@ class Assistant(Agent):
         """
         if not consent_given:
             logger.info("create_escalation skipped — no caller consent")
+            self.escalation_consent_declined = True
             return "Not created — caller consent is required before sending anything to a human."
 
         if reason not in escalation.ESCALATION_REASONS:
@@ -631,6 +699,7 @@ class Assistant(Agent):
                 db.set_escalation_notify_status, record["id"], notify_status
             )
             self.escalation_ids[reason] = record["id"]
+            self.escalation_success = {"reason": reason, "urgency": record["urgency"]}
             return (
                 f"UPDATED existing open request, reference_id={record['id']!r}, "
                 f"urgency={record['urgency']!r}, status={record['status']!r}, "
@@ -656,6 +725,7 @@ class Assistant(Agent):
             db.set_escalation_notify_status, record["id"], notify_status
         )
         self.escalation_ids[reason] = record["id"]
+        self.escalation_success = {"reason": reason, "urgency": urgency}
         return (
             f"CREATED, reference_id={record['id']!r}, urgency={urgency!r}, "
             f"status='open', notify={notify_status!r}. Tell the caller this "
@@ -753,6 +823,71 @@ RETRY_POLICY_PATH = (
 # having ended the call ourselves, is almost certainly a rejection rather
 # than a call that ran its course.
 IMMEDIATE_HANGUP_THRESHOLD_SECONDS = 8.0
+
+# Deterministic backstops for the "Ending the Call" / "Handling Silence"
+# rules in SYSTEM_PROMPT: the LLM is instructed to say a farewell and call
+# end_call in the SAME turn, but this is a prompt-only guarantee — confirmed
+# live (2026-08-25, twice) that it can say the farewell and simply not also
+# emit the end_call tool call, leaving the room open indefinitely with
+# nobody talking. my_agent()'s idle watchdog force-disconnects in two cases:
+#
+# 1. farewell_grace_seconds — the agent's own turn looked like the scripted
+#    farewell (see _looks_like_farewell), so nothing more is expected from
+#    the caller. Short, because we already know the call is over.
+# 2. idle_hangup_timeout_seconds — a general backstop for total silence on
+#    BOTH sides with no farewell at all (e.g. a stuck tool call, dead air).
+#    Long enough not to cut off a slow human response to an actual question.
+#
+# Both durations live in config/call_ending.json, not here, so they can be
+# retuned without a code change or restart — see _load_call_ending_config().
+CALL_ENDING_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "call_ending.json"
+)
+_CALL_ENDING_DEFAULTS = {
+    "farewell_grace_seconds": 5.0,
+    "idle_hangup_timeout_seconds": 20.0,
+}
+
+
+def _load_call_ending_config() -> dict:
+    """Re-read on every call rather than cached at import — a config file
+    is only worth having if editing it takes effect without a restart. Any
+    problem reading it (missing file, bad JSON) fails closed to the
+    defaults above rather than crashing an otherwise-fine call.
+    """
+    try:
+        with CALL_ENDING_CONFIG_PATH.open(encoding="utf-8") as f:
+            config = json.load(f)
+        return {**_CALL_ENDING_DEFAULTS, **config}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(
+            "Failed to load call-ending config from %s: %s — using defaults %s",
+            CALL_ENDING_CONFIG_PATH,
+            e,
+            _CALL_ENDING_DEFAULTS,
+        )
+        return dict(_CALL_ENDING_DEFAULTS)
+
+# The exact strings SYSTEM_PROMPT's "Ending the Call" rule scripts, verbatim
+# reproduced by the model in both live tests above. "ख्याल" (not bare
+# "नमस्ते") is used for Hindi specifically because "नमस्ते" alone is also
+# used in the *separate* "Handling Silence" check-in line ("नमस्ते, क्या आप
+# मुझे सुन पा रहे हैं?" — "hello, can you hear me?"), which must NOT trigger
+# the short farewell grace period — that line still expects a reply.
+_FAREWELL_MARKERS = ("goodbye", "take care", "ख्याल")
+
+
+def _looks_like_farewell(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _FAREWELL_MARKERS)
+
+
+# What Assistant.end_call() speaks itself when the model's turn didn't
+# include a farewell — the exact lines SYSTEM_PROMPT's "Ending the Call"
+# rule scripts, so a caller can't tell the fallback apart from the real one.
+_FALLBACK_FAREWELL_EN = "Take care, goodbye!"
+_FALLBACK_FAREWELL_HI = "अपना ख्याल रखें, नमस्ते!"
+
 
 # Standard SIP final-response codes, mapped to our outcome buckets. Verified
 # against two real TwirpErrors from this project's own LiveKit SIP service
@@ -1000,8 +1135,30 @@ async def my_agent(ctx: JobContext):
     # # Start the avatar and wait for it to join
     # await avatar.start(session, room=ctx.room)
 
+    # Day-8 call-outcome bookkeeping — see CALL SUCCESS DEFINITION above and
+    # _determine_call_outcome() below, which is where these actually get
+    # turned into a success/failure verdict once the call ends.
+    channel = "browser"  # overwritten by _link_caller() if this is a SIP call
+    user_message_count = 0
+    latency_samples: list[float] = []  # TTS time-to-first-byte, per agent turn
+    last_activity_at = time.time()  # bumped on every turn — see idle watchdog below
+    # Set to the timestamp of the agent's turn the moment it looks like the
+    # scripted farewell (see _looks_like_farewell); cleared the moment
+    # anything else happens. None means "no farewell pending."
+    farewell_spoken_at: float | None = None
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event):
+        nonlocal user_message_count, last_activity_at, farewell_spoken_at
+        last_activity_at = time.time()
+        if event.item.role == "user":
+            user_message_count += 1
+        farewell_spoken_at = (
+            last_activity_at
+            if event.item.role == "assistant"
+            and _looks_like_farewell(event.item.text_content or "")
+            else None
+        )
         db.save_message(
             db_session_id,
             event.item.role,
@@ -1009,9 +1166,110 @@ async def my_agent(ctx: JobContext):
             event.item.created_at,
         )
 
+    @session.on("function_tools_executed")
+    def _on_function_tools_executed(event):
+        # A tool RAISING (as opposed to returning a normal — possibly
+        # "not found" — string) is a genuine tool_failure, not just a call
+        # that didn't reach success. See db.FAILURE_CATEGORIES.
+        if any(
+            output is not None and output.is_error
+            for output in event.function_call_outputs
+        ):
+            assistant.tool_exception_occurred = True
+
+    def _determine_call_outcome(close_event) -> tuple[str, str | None, str | None]:
+        """The CALL SUCCESS DEFINITION, applied to what actually happened
+        during this specific call. Returns (outcome, failure_category,
+        track_outcome). Only ever called once, from _on_close below.
+        """
+        if assistant.triage_results:
+            level = assistant.triage_results[-1]["level"]
+            return "success", None, f"triage:{level}"
+        if assistant.escalation_success:
+            reason = assistant.escalation_success["reason"]
+            urgency = assistant.escalation_success["urgency"]
+            return "success", None, f"escalation:{reason}:{urgency}"
+        if assistant.kb_hit:
+            return "success", None, "kb_answered"
+
+        if assistant.tool_exception_occurred:
+            return "failed", "tool_failure", None
+        if close_event.error is not None or close_event.reason == CloseReason.ERROR:
+            return "failed", "api_error", None
+        if assistant.escalation_consent_declined:
+            return "failed", "user_declined", None
+        if user_message_count == 0:
+            return "failed", "no_response", None
+        if (
+            close_event.reason == CloseReason.PARTICIPANT_DISCONNECTED
+            and not assistant.agent_ended_call
+        ):
+            return "failed", "hangup", None
+        return "failed", "incomplete", None
+
+    async def _force_disconnect(reason: str) -> None:
+        logger.warning("%s — force-disconnecting room %s", reason, ctx.room.name)
+        # So _determine_call_outcome doesn't miscategorize this as the
+        # caller hanging up on us.
+        assistant.agent_ended_call = True
+        try:
+            await ctx.delete_room()
+        except Exception:
+            logger.warning("Idle-watchdog force-disconnect failed", exc_info=True)
+
+    async def _idle_hangup_watchdog() -> None:
+        """Force-disconnects a call end_call didn't, regardless of whether
+        the tool ever actually got invoked — see the two triggers loaded
+        from config/call_ending.json below. Read once per call (not on
+        every poll) so a mid-call edit to the file can't move the goalposts
+        partway through — the next call picks it up instead. Cancelled the
+        instant the session closes normally (see _on_close), so it never
+        fires against an already-ended call. Polls every second so the
+        farewell grace period is honored fairly precisely.
+        """
+        config = _load_call_ending_config()
+        farewell_grace_seconds = config["farewell_grace_seconds"]
+        idle_hangup_timeout_seconds = config["idle_hangup_timeout_seconds"]
+        try:
+            while True:
+                await asyncio.sleep(1)
+                now = time.time()
+                if (
+                    farewell_spoken_at is not None
+                    and now - farewell_spoken_at >= farewell_grace_seconds
+                ):
+                    await _force_disconnect(
+                        f"Farewell spoken {now - farewell_spoken_at:.0f}s ago with no end_call"
+                    )
+                    return
+                idle_for = now - last_activity_at
+                if idle_for >= idle_hangup_timeout_seconds:
+                    await _force_disconnect(f"Room idle for {idle_for:.0f}s")
+                    return
+        except asyncio.CancelledError:
+            pass
+
     @session.on("close")
     def _on_close(event):
+        idle_watchdog_task.cancel()
         db.end_call_session(db_session_id, event.reason.value)
+
+        outcome, failure_category, track_outcome = _determine_call_outcome(event)
+        avg_latency_ms = (
+            round(sum(latency_samples) / len(latency_samples), 1)
+            if latency_samples
+            else None
+        )
+        db.record_call_outcome(
+            db_session_id,
+            outcome=outcome,
+            failure_category=failure_category,
+            track_outcome=track_outcome,
+            channel=channel,
+            language="hi" if current_tts_locale.startswith("hi") else "en",
+            avg_response_latency_ms=avg_latency_ms,
+        )
+
         # For an outbound call that actually connected, this is where we
         # find out how it ended — persist the final outcome + retry
         # schedule now that we know it. (Dial-time failures — no_answer /
@@ -1056,6 +1314,10 @@ async def my_agent(ctx: JobContext):
             kind, latency_ms = "stt", metrics.transcription_delay * 1000
         elif metrics.type == "tts_metrics":
             kind, latency_ms = "tts", metrics.ttfb * 1000
+            # "How long until it started speaking" — the Day-8 dashboard's
+            # latency figure. Sampled here rather than STT delay since this
+            # is what a caller actually experiences as response time.
+            latency_samples.append(latency_ms)
         else:
             return
         payload = json.dumps(
@@ -1084,6 +1346,11 @@ async def my_agent(ctx: JobContext):
         target_locale = (
             "hi-IN" if str(event.language).lower().startswith("hi") else "en-IN"
         )
+        # Mirrored onto the Assistant instance regardless of whether the TTS
+        # locale actually switches below — end_call()'s fallback-farewell
+        # language should track the caller's most recent utterance exactly,
+        # not the (deliberately stickier) TTS-switch logic.
+        assistant.current_language = "hi" if target_locale == "hi-IN" else "en"
         if target_locale != current_tts_locale and session.tts is not None:
             current_tts_locale = target_locale
             # update_options() is a Murf TTS extension, not part of the
@@ -1115,6 +1382,12 @@ async def my_agent(ctx: JobContext):
         # lookup_caller / save_caller_profile tools above.
         db.set_participant(db_session_id, participant.identity)
         assistant.user_id = resolve_caller_user_id(participant)
+        nonlocal channel
+        channel = (
+            "sip"
+            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+            else "browser"
+        )
 
     @ctx.room.on("participant_connected")
     def _on_participant_connected(participant: rtc.RemoteParticipant):
@@ -1145,6 +1418,21 @@ async def my_agent(ctx: JobContext):
                 next_retry_at=next_retry_at(dial_outcome, outbound_call.attempt_number),
             )
             db.end_call_session(db_session_id, f"outbound_{dial_outcome}")
+            # Never connected, so there was never a chance to reach the CALL
+            # SUCCESS DEFINITION — record it as a failed call rather than
+            # leaving outcome NULL (which would silently exclude it from the
+            # Day-8 dashboard's totals).
+            db.record_call_outcome(
+                db_session_id,
+                outcome="failed",
+                failure_category="tool_failure"
+                if dial_outcome == "failed"
+                else "no_response",
+                track_outcome=f"outbound_dial:{dial_outcome}",
+                channel="sip",
+                language=None,
+                avg_response_latency_ms=None,
+            )
             return
 
         # Answered — default outcome unless the disconnect handler below or
@@ -1167,6 +1455,16 @@ async def my_agent(ctx: JobContext):
                 assistant.outbound_outcome = "immediate_hangup"
 
         ctx.room.on("participant_disconnected", _on_sip_participant_disconnected)
+
+    # Only start the idle watchdog once the call is actually live — for an
+    # outbound call that's right here, after the callee has ANSWERED (the
+    # dial_outcome != "answered" branch above already returned), never
+    # during the ringing_timeout=30s wait, which would otherwise force-
+    # disconnect a call that's still ringing. For inbound, outbound_call is
+    # None and this point is reached immediately after connect. Reset the
+    # clock right before arming it so nothing counts against the dial delay.
+    last_activity_at = time.time()
+    idle_watchdog_task = asyncio.create_task(_idle_hangup_watchdog())
 
     if outbound_call is not None and outbound_call.call_type is not None:
         # Purposeful outbound call: skip the generic inbound-style greeting

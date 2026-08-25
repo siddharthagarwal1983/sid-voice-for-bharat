@@ -280,6 +280,22 @@ Classification is built on **two** real errors captured from this project's own 
 
 `immediate_hangup` is a plain `participant_disconnected` timer check. Every outcome is logged to the `outbound_call_attempts` table (`db.py`) via `db.record_outbound_attempt`.
 
+#### Ending calls: always goodbye, then hang up — timing lives in `config/call_ending.json`
+
+`SYSTEM_PROMPT`'s "Ending the Call" rule requires the agent to say a brief farewell and call `end_call` in that same turn — never the reverse, and never one without the other. That's a prompt-only guarantee though, so `my_agent()` runs an idle watchdog that force-disconnects the room if the LLM doesn't follow through:
+
+```json
+{
+  "farewell_grace_seconds": 5.0,
+  "idle_hangup_timeout_seconds": 20.0
+}
+```
+
+- `farewell_grace_seconds` — once the agent's own turn looks like the scripted farewell (see `_looks_like_farewell` in `agent.py`), how long to wait for `end_call` before forcing the disconnect anyway. Short, since nothing more is expected from the caller at that point.
+- `idle_hangup_timeout_seconds` — a general backstop for total silence on both sides with no farewell at all (a stuck tool call, dead air). Longer, so it doesn't cut off a slow human response to an actual question.
+
+`_load_call_ending_config()` re-reads this file once per call (not cached at import), so retuning either value takes effect on the next call without a code change or worker restart. A missing or invalid file fails closed to the defaults above rather than crashing the call.
+
 #### Retry rules live in `config/retry_policy.json`, not in code
 
 ```json
@@ -345,6 +361,18 @@ uv run python scripts/escalation_followup_calls.py
 
 Same one-pass-and-exit pattern as `scripts/retry_outbound_calls.py` — run it periodically. It finds resolved requests where the caller id looks like a phone number (`db.due_escalation_callbacks()`) and dispatches a `call_type="escalation_followup"` outbound call, which references the resolution note per the `OUTBOUND CALLS` section of `SYSTEM_PROMPT`, then marks it called-back so it's never dialed twice.
 
+## Call outcome dashboard (Day 8)
+
+**Success definition (Health Access track):** a call is successful if the caller received either safe guidance (a `classify_symptom_triage` routing decision, or a grounded answer from `search_knowledge_base`) or an appropriate human escalation (a successful `create_escalation`). See the `CALL SUCCESS DEFINITION` comment above `SYSTEM_PROMPT` in [`src/agent.py`](src/agent.py) for the full note.
+
+Every call's outcome is decided once, in `my_agent()`'s session `close` handler, from what actually happened during that specific call — never hardcoded. A failed call isn't necessarily a bug: it's stored with a `failure_category` — `user_declined`, `incomplete`, `tool_failure`, `api_error`, `no_response`, or `hangup` (see `db.FAILURE_CATEGORIES`) — so you can tell "the caller hung up early" apart from "our STT errored."
+
+```bash
+uv run python scripts/call_dashboard.py
+```
+
+Then open `http://localhost:8000`. It shows total/successful/failed calls, success rate, a failure-category and outcome-detail breakdown, calls-per-day, and a recent-calls table — filterable by channel (browser/SIP), language, and date range, auto-refreshing every 15s. It only ever reads the small set of outcome columns on `call_sessions`: it never reads the `messages` table (full transcripts), the `callers` table (names/medical facts), or `participant_identity` (often a phone number) — see the privacy note at the top of [`scripts/call_dashboard.py`](scripts/call_dashboard.py).
+
 ## Testing
 
 The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):
@@ -387,13 +415,15 @@ backend/
 │   ├── agent.py          # Agent entrypoint — pipeline, prompt, config
 │   └── escalation.py     # Human-escalation reasons, urgency, redaction, webhook delivery
 ├── config/
-│   └── retry_policy.json # Outbound retry delays/attempt caps + on/off switch
+│   ├── retry_policy.json # Outbound retry delays/attempt caps + on/off switch
+│   └── call_ending.json  # Farewell grace / idle-hangup timeouts (see "Ending calls" above)
 ├── scripts/
 │   ├── setup_outbound_trunk.py       # One-time: create the Twilio outbound SIP trunk
 │   ├── make_outbound_call.py         # Place an outbound call
 │   ├── retry_outbound_calls.py       # Re-dispatch due outbound retries (run periodically)
 │   ├── escalation_dashboard.py       # Local dashboard for open/resolved human-escalation requests
-│   └── escalation_followup_calls.py  # Callback resolved escalations (run periodically)
+│   ├── escalation_followup_calls.py  # Callback resolved escalations (run periodically)
+│   └── call_dashboard.py             # Day-8 dashboard: total/successful/failed calls, success rate, filters
 ├── tests/
 │   └── test_agent.py     # LLM-judged eval suite
 ├── .env.example           # Environment variable template
