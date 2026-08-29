@@ -207,7 +207,7 @@ There are three separate specialists, each with exactly one job — booking, che
 - transfer_to_radiology_specialist: an imaging/scan appointment — X-ray, ultrasound, CT scan, MRI, mammogram, or similar.
 - transfer_to_pathology_specialist: a lab/diagnostic test appointment — blood test, urine test, biopsy sample collection, or similar (not imaging).
 
-If the caller isn't sure which kind they need (e.g. "the doctor asked me to get some tests done"), ask ONE brief clarifying question yourself first rather than guessing which specialist to route to. Keep handling plain "where is the nearest facility" questions yourself with find_nearby_health_facility — only hand off once it's genuinely about booking or managing one of these three kinds of appointment. Never hand off for symptoms, triage, scheme/eligibility questions, or anything needing human escalation — those stay with you. Before calling any of these tools, briefly tell the caller in your own words, in whichever language you're currently speaking, that you're connecting them to the relevant specialist.
+If the caller isn't sure which kind they need (e.g. "the doctor asked me to get some tests done"), ask ONE brief clarifying question yourself first rather than guessing which specialist to route to. Keep handling plain "where is the nearest facility" questions yourself with find_nearby_health_facility — only hand off once it's genuinely about booking or managing one of these three kinds of appointment. Never hand off for symptoms, triage, scheme/eligibility questions, or anything needing human escalation — those stay with you. The instant you decide a handoff is needed, call the matching tool right away IN THE SAME TURN — do not spend a turn only telling the caller you're connecting them and stop there without actually calling the tool; that leaves the caller on hold with nothing happening until they speak again. The specialist introduces itself automatically the moment it takes over, so you never need to announce the handoff yourself.
 """
 
 
@@ -898,14 +898,25 @@ class Assistant(Agent):
         self,
         specialist_cls: type["_AppointmentSpecialistBase"],
         reason: str,
-    ) -> tuple[str, Agent] | str:
+    ) -> Agent | str:
         """Shared handoff logic for all three Day-9 appointment specialists
-        — construction, the failed-handoff fallback, and the deterministic
-        current-language directive (see the on_enter comment on
-        _AppointmentSpecialistBase for why that's spelled out explicitly
-        rather than left for the model to infer). Not itself a tool — each
-        transfer_to_*_specialist method below is the actual tool, with its
-        own docstring describing when the LLM should call it.
+        — construction and the failed-handoff fallback. Not itself a tool —
+        each transfer_to_*_specialist method below is the actual tool, with
+        its own docstring describing when the LLM should call it.
+
+        Returns the bare specialist Agent (not a (message, Agent) tuple) on
+        success so the framework does NOT also force a "reply required" turn
+        out of the main agent afterwards — that used to run concurrently
+        with the specialist's own on_enter() introduction and raced with it.
+        Confirmed live (2026-08-29): with the old "tell the caller you're
+        connecting them, then call this tool" docstring wording, the
+        production LLM (gemini-3.5-flash-lite) would frequently speak that
+        line WITHOUT calling the tool in the same turn, leaving the call
+        silent until the caller prompted again. Reproduced 4/5 times via
+        session.run() with the real model. The specialist's own on_enter is
+        the sole, deterministic source of the "connecting/introducing"
+        speech now — the main agent just calls the tool and says nothing
+        else that turn.
         """
         try:
             specialist = specialist_cls(
@@ -931,22 +942,12 @@ class Assistant(Agent):
                 "mention this as a technical error to the caller — just "
                 "smoothly continue helping."
             )
-        language_name = "HINDI" if self.current_language == "hi" else "ENGLISH"
-        return (
-            "TRANSFERRING — if you haven't already said so this turn, tell "
-            "the caller now, briefly, that you're connecting them to the "
-            f"{specialist_cls.specialist_label}, IN {language_name} — that is "
-            "the language the caller is currently speaking with you, per the "
-            "conversation so far. Do not use the other language for this "
-            "line. The specialist is taking over from here and already "
-            f"knows why: {reason!r}.",
-            specialist,
-        )
+        return specialist
 
     @function_tool
     async def transfer_to_clinic_specialist(
         self, context: RunContext, reason: str
-    ) -> tuple[str, Agent] | str:
+    ) -> Agent | str:
         """Hand the conversation off to the Clinic and Appointment
         Specialist — a separate agent whose only job is finding a clinic and
         booking, checking, rescheduling, or cancelling a DOCTOR/OPD
@@ -963,11 +964,11 @@ class Assistant(Agent):
         human escalation — you handle those yourself, per your own
         instructions.
 
-        Before calling this tool, tell the caller in your own words, in
-        whichever language you're currently speaking with them right now,
-        that you're connecting them to the clinic and appointment
-        specialist. Match their most recent message's language exactly —
-        do not switch languages for this line.
+        Call this tool immediately, in the same turn, once you decide the
+        caller needs this specialist — do not just tell the caller you're
+        connecting them and stop there without calling it; the specialist
+        introduces itself automatically once it takes over, so you don't
+        need to announce the handoff yourself.
 
         Args:
             reason: A short note on what the caller needs (e.g. "wants to
@@ -982,7 +983,7 @@ class Assistant(Agent):
     @function_tool
     async def transfer_to_radiology_specialist(
         self, context: RunContext, reason: str
-    ) -> tuple[str, Agent] | str:
+    ) -> Agent | str:
         """Hand the conversation off to the Radiology Appointment Specialist
         — a separate agent whose only job is finding a facility and booking,
         checking, rescheduling, or cancelling an IMAGING/SCAN appointment
@@ -999,11 +1000,11 @@ class Assistant(Agent):
         human escalation — you handle those yourself, per your own
         instructions.
 
-        Before calling this tool, tell the caller in your own words, in
-        whichever language you're currently speaking with them right now,
-        that you're connecting them to the radiology appointment specialist.
-        Match their most recent message's language exactly — do not switch
-        languages for this line.
+        Call this tool immediately, in the same turn, once you decide the
+        caller needs this specialist — do not just tell the caller you're
+        connecting them and stop there without calling it; the specialist
+        introduces itself automatically once it takes over, so you don't
+        need to announce the handoff yourself.
 
         Args:
             reason: A short note on what the caller needs (e.g. "needs a
@@ -1018,7 +1019,7 @@ class Assistant(Agent):
     @function_tool
     async def transfer_to_pathology_specialist(
         self, context: RunContext, reason: str
-    ) -> tuple[str, Agent] | str:
+    ) -> Agent | str:
         """Hand the conversation off to the Pathology and Lab Test
         Specialist — a separate agent whose only job is finding a facility
         and booking, checking, rescheduling, or cancelling a LAB/DIAGNOSTIC
@@ -1036,11 +1037,11 @@ class Assistant(Agent):
         human escalation — you handle those yourself, per your own
         instructions.
 
-        Before calling this tool, tell the caller in your own words, in
-        whichever language you're currently speaking with them right now,
-        that you're connecting them to the pathology and lab test
-        specialist. Match their most recent message's language exactly —
-        do not switch languages for this line.
+        Call this tool immediately, in the same turn, once you decide the
+        caller needs this specialist — do not just tell the caller you're
+        connecting them and stop there without calling it; the specialist
+        introduces itself automatically once it takes over, so you don't
+        need to announce the handoff yourself.
 
         Args:
             reason: A short note on what the caller needs (e.g. "needs a
