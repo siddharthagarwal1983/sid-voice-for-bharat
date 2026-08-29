@@ -71,7 +71,15 @@ Start both services in the background and wait for each to report ready.
 is unnecessary (and just runs unused) when `.env.local` already points
 at LiveKit Cloud — start the two app processes directly instead:
 
+Always free port 3000 first, even if you think nothing is running there —
+a `next dev` from a previous session can survive as a zombie that never
+actually bound the port (see Gotchas), and starting a second one on top
+makes both useless:
+
 ```bash
+lsof -ti:3000 -sTCP:LISTEN | xargs -r kill
+pkill -f "src/agent.py dev" 2>/dev/null
+
 (cd backend && uv run python src/agent.py dev > /tmp/backend_agent.log 2>&1 &)
 (cd frontend && pnpm dev > /tmp/frontend_dev.log 2>&1 &)
 
@@ -121,6 +129,26 @@ cd backend && uv run pytest tests/test_agent.py -q
 
 ## Gotchas
 
+- **A `pnpm dev`/`next dev` started while port 3000 is already taken
+  becomes a zombie, not an error.** Confirmed live in this session:
+  relaunching the frontend without freeing the port first left the old
+  `next dev` process alive (visible in `pgrep`) but not actually bound
+  to :3000 (absent from `lsof -ti:3000`) — it silently hung, almost
+  certainly on Next's unanswered "port in use, use another? (Y/n)"
+  prompt with no TTY to answer it. Symptom from the browser: the
+  frontend still serves stale content or none at all, and if a client
+  is mid-connection when this happens, LiveKit's client throws
+  `Unknown DataChannel error on reliable/lossy {}` in the console
+  because there's nothing real behind the page. Always run the
+  port-3000 kill line above before relaunching, even if you believe
+  nothing is running.
+- **The same `Unknown DataChannel error` also shows up whenever the
+  backend agent isn't running at all** — the frontend can still mint a
+  LiveKit token and open a room on its own, but no agent joins to be
+  the data channel's peer. Check for it with
+  `pgrep -fl "src/agent.py dev"` and confirm `db.call_sessions` has a
+  row with a recent `started_at` — if not, the backend was never in
+  the loop for that call attempt, and the "fix" is just starting it.
 - **LLM-judge tests are flaky, not broken.** `test_grounding` and
   `test_specialist_does_not_bounce_back_on_stale_context` each failed
   once in this session on a nitpicky judge verdict over an already-correct
