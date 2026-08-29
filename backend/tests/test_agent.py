@@ -4,7 +4,12 @@ import pytest
 from livekit.agents import AgentSession, inference, llm
 
 import db
-from agent import Assistant
+from agent import (
+    Assistant,
+    ClinicAppointmentSpecialist,
+    PathologyAppointmentSpecialist,
+    RadiologyAppointmentSpecialist,
+)
 
 
 def _llm() -> llm.LLM:
@@ -248,6 +253,253 @@ async def test_caller_consent_creates_escalation_with_reference_id() -> None:
                 review it) without promising an immediate reply.
                 """,
             )
+        )
+
+
+@pytest.mark.asyncio
+async def test_facility_question_stays_with_main_agent() -> None:
+    """Day 9: a plain "where is the nearest facility" question is normal
+    conversation for the main agent — it must NOT hand off to the clinic
+    and appointment specialist for this."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="Where is the nearest government hospital? I'm in Pune."
+        )
+
+        assert not any(
+            event.type == "function_call"
+            and event.item.name == "transfer_to_clinic_specialist"
+            for event in result.events
+        ), "a plain facility-location question must stay with the main agent"
+
+
+@pytest.mark.asyncio
+async def test_appointment_booking_routes_to_clinic_specialist() -> None:
+    """Day 9: a caller asking to book/schedule a clinic appointment must be
+    handed off to the Clinic and Appointment Specialist, and the specialist
+    must introduce itself after taking over — the caller shouldn't have to
+    repeat what they just said."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input=(
+                "I'd like to book a follow-up appointment at the PHC next "
+                "Tuesday morning."
+            )
+        )
+
+        assert any(
+            event.type == "function_call"
+            and event.item.name == "transfer_to_clinic_specialist"
+            for event in result.events
+        ), "a request to book an appointment must hand off to the clinic specialist"
+
+        assert isinstance(session.current_agent, ClinicAppointmentSpecialist), (
+            "the session's active agent must be the clinic specialist after handoff"
+        )
+
+        await (
+            result.expect[:]
+            .contains_message(role="assistant")
+            .judge(
+                llm,
+                intent="""
+                Somewhere in these messages, the assistant introduces itself as
+                (or clearly identifies itself as) a clinic/appointment
+                specialist taking over the conversation, OR tells the caller
+                it is connecting them to such a specialist. It should not ask
+                the caller to repeat the appointment request they just made.
+                """,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_imaging_request_routes_to_radiology_specialist() -> None:
+    """Day 9 (3 specialists): a caller asking to book an imaging/scan
+    appointment must route to the Radiology Appointment Specialist, not the
+    general clinic specialist — these are two different specialists with
+    two different jobs."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="My doctor wants me to get a chest X-ray done, can you book that?"
+        )
+
+        assert any(
+            event.type == "function_call"
+            and event.item.name == "transfer_to_radiology_specialist"
+            for event in result.events
+        ), "a request to book an X-ray must hand off to the radiology specialist"
+        assert not any(
+            event.type == "function_call"
+            and event.item.name
+            in ("transfer_to_clinic_specialist", "transfer_to_pathology_specialist")
+            for event in result.events
+        ), "an imaging request must not go to the clinic or pathology specialist"
+
+        assert isinstance(session.current_agent, RadiologyAppointmentSpecialist), (
+            "the session's active agent must be the radiology specialist after handoff"
+        )
+
+
+@pytest.mark.asyncio
+async def test_specialist_does_not_bounce_back_on_stale_context() -> None:
+    """Regression test (2026-08-26 live bug): a caller got mild-symptom
+    advice from the main assistant (already resolved), THEN asked to book a
+    pathology appointment. The pathology specialist's on_enter reply saw the
+    earlier "headache" mention in the inherited chat history and treated it
+    as a fresh reason to call transfer_back_to_main_assistant, which then
+    routed straight back to the specialist — an infinite bounce loop that
+    only ended when the caller gave up and disconnected. Fixed by explicitly
+    telling the specialist, in on_enter and in its own SCOPE guardrail, that
+    stale/already-resolved history is not a handoff trigger. This checks the
+    specialist actually stays and does NOT immediately hand back."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        await session.run(user_input="I have a mild headache.")
+
+        result = await session.run(
+            user_input="Can you book me an appointment with the nearest path lab?"
+        )
+
+        assert any(
+            event.type == "function_call"
+            and event.item.name == "transfer_to_pathology_specialist"
+            for event in result.events
+        ), "the booking request must still hand off to the pathology specialist"
+
+        assert not any(
+            event.type == "function_call"
+            and event.item.name == "transfer_back_to_main_assistant"
+            for event in result.events
+        ), (
+            "the specialist must not immediately bounce back citing the "
+            "earlier, already-resolved headache mention"
+        )
+
+        assert isinstance(session.current_agent, PathologyAppointmentSpecialist), (
+            "the session must end this turn on the pathology specialist, not "
+            "bounced back to the main assistant"
+        )
+
+
+@pytest.mark.asyncio
+async def test_lab_test_request_routes_to_pathology_specialist() -> None:
+    """Day 9 (3 specialists): a caller asking to book a lab/blood test
+    appointment must route to the Pathology and Lab Test Specialist, not the
+    general clinic specialist or the radiology specialist."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(
+            user_input="I need to get a fasting blood sugar test done, can you book that for me?"
+        )
+
+        assert any(
+            event.type == "function_call"
+            and event.item.name == "transfer_to_pathology_specialist"
+            for event in result.events
+        ), "a request to book a lab test must hand off to the pathology specialist"
+        assert not any(
+            event.type == "function_call"
+            and event.item.name
+            in ("transfer_to_clinic_specialist", "transfer_to_radiology_specialist")
+            for event in result.events
+        ), "a lab test request must not go to the clinic or radiology specialist"
+
+        assert isinstance(session.current_agent, PathologyAppointmentSpecialist), (
+            "the session's active agent must be the pathology specialist after handoff"
+        )
+
+
+@pytest.mark.asyncio
+async def test_booked_appointment_counts_as_call_success() -> None:
+    """Day 9 + Day 8: a successfully logged appointment request must count
+    as a Day-8 call success signal — recorded onto the SAME main Assistant
+    instance the specialist was handed off from, per CALL SUCCESS DEFINITION.
+    A direct tool-level test (no LLM) since this is deterministic bookkeeping,
+    not a judgment call."""
+    main_agent = Assistant(user_id="+911234500000")
+    specialist = ClinicAppointmentSpecialist(
+        main_agent=main_agent,
+        chat_ctx=main_agent.chat_ctx,
+        user_id=main_agent.user_id,
+        room=None,
+        current_language="en",
+        handoff_reason="wants to book a follow-up",
+    )
+
+    assert main_agent.appointment_booked is None
+
+    await specialist.book_appointment(
+        None,
+        facility_name="Sassoon General Hospital",
+        preferred_date="next Tuesday",
+        preferred_time="11am",
+        reason="follow-up",
+    )
+
+    assert main_agent.appointment_booked is not None
+    assert main_agent.appointment_booked["facility"] == "Sassoon General Hospital"
+
+    appointments = db.list_appointments_for_caller("+911234500000")
+    assert len(appointments) == 1
+    assert appointments[0]["id"] == main_agent.appointment_booked["appointment_id"]
+
+
+@pytest.mark.asyncio
+async def test_specialist_replies_in_english_for_an_english_call() -> None:
+    """Regression test (2026-08-26 live bug): an earlier version of the
+    clinic specialist's on_enter/handoff instructions embedded ready-made
+    English AND Hindi example sentences side by side, and the model would
+    sometimes just copy the Hindi one verbatim even though the whole call
+    was in English. The fix replaced those with a deterministic
+    "respond IN {language}" directive. This checks no Devanagari text
+    leaks into the specialist's introduction when the caller only ever
+    spoke English."""
+    async with (
+        _llm() as llm,
+        AgentSession(llm=llm) as session,
+    ):
+        await session.start(Assistant())
+
+        result = await session.run(user_input="I need to book an appointment.")
+
+        devanagari_range = range(0x0900, 0x097F + 1)
+
+        def has_devanagari(text: str) -> bool:
+            return any(ord(ch) in devanagari_range for ch in text)
+
+        assistant_texts = [
+            event.item.text_content or ""
+            for event in result.events
+            if event.type == "message" and event.item.role == "assistant"
+        ]
+        assert assistant_texts, "expected at least one assistant message"
+        assert not any(has_devanagari(t) for t in assistant_texts), (
+            f"specialist/main agent replied in Hindi during an all-English "
+            f"call: {assistant_texts!r}"
         )
 
 

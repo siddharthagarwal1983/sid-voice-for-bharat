@@ -153,6 +153,37 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_escalations_user_reason "
             "ON escalations(user_id, reason, status)"
         )
+        # Appointment requests (Day 9 — see src/agent.py's appointment
+        # specialists: ClinicAppointmentSpecialist, RadiologyAppointment
+        # Specialist, PathologyAppointmentSpecialist). `status` is one of
+        # requested/cancelled — this is a REQUEST log, not a live booking
+        # system with real facility availability, so it never becomes
+        # "confirmed" here; each specialist is instructed to describe it
+        # honestly as a logged request, same honesty pattern as escalations.
+        # `appointment_type` is one of clinic/radiology/pathology — which
+        # specialist created it, so a caller's requests can be filtered per
+        # specialist instead of every specialist seeing every other's.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointments (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                facility_name TEXT NOT NULL,
+                district TEXT,
+                preferred_date TEXT NOT NULL,
+                preferred_time TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'requested',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "appointments", "appointment_type", "TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_user "
+            "ON appointments(user_id, status)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_sessions_outcome "
             "ON call_sessions(outcome, started_at)"
@@ -572,6 +603,125 @@ def mark_escalation_called_back(escalation_id: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Appointment requests (Day 9 — see src/agent.py's appointment specialists).
+# Short, speakable reference ids, same pattern as escalations above.
+# ---------------------------------------------------------------------------
+
+APPOINTMENT_TYPES = ("clinic", "radiology", "pathology")
+
+
+def _new_appointment_id() -> str:
+    return uuid.uuid4().hex[:8].upper()
+
+
+def create_appointment(
+    *,
+    user_id: str | None,
+    facility_name: str,
+    district: str | None,
+    preferred_date: str,
+    preferred_time: str | None,
+    reason: str | None,
+    appointment_type: str = "clinic",
+) -> dict:
+    appointment_id = _new_appointment_id()
+    now = time.time()
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO appointments
+                (id, user_id, facility_name, district, preferred_date,
+                 preferred_time, reason, status, appointment_type,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)
+            """,
+            (
+                appointment_id,
+                user_id,
+                facility_name,
+                district,
+                preferred_date,
+                preferred_time,
+                reason,
+                appointment_type,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_appointment(appointment_id)
+
+
+def get_appointment(appointment_id: str) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_appointments_for_caller(
+    user_id: str, appointment_type: str | None = None
+) -> list[dict]:
+    """All non-cancelled appointment requests for this caller, newest first.
+    Returns an empty list if `user_id` is falsy — there's nothing to look up
+    for a caller with no stable identity yet. Pass `appointment_type` (one of
+    APPOINTMENT_TYPES) to see only that specialist's requests — e.g. so the
+    radiology specialist doesn't surface a caller's pathology requests;
+    leave it None to see everything on file, across all specialists.
+    """
+    if not user_id:
+        return []
+    conn = get_connection()
+    try:
+        if appointment_type:
+            rows = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE user_id = ? AND status != 'cancelled' AND appointment_type = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, appointment_type),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM appointments
+                WHERE user_id = ? AND status != 'cancelled'
+                ORDER BY created_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def cancel_appointment(appointment_id: str) -> dict | None:
+    """Marks an appointment request cancelled. Returns the updated row, or
+    None if no appointment with that id exists."""
+    existing = get_appointment(appointment_id)
+    if existing is None:
+        return None
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE appointments SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            (time.time(), appointment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_appointment(appointment_id)
 
 
 # ---------------------------------------------------------------------------

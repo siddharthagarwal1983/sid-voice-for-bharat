@@ -43,7 +43,12 @@ load_dotenv(".env.local")
 #      triage was called and returned a level), or a grounded scheme/
 #      eligibility answer (search_knowledge_base found a match), or
 #   2. An appropriate escalation — create_escalation succeeded (the caller
-#      consented and a request was created or updated).
+#      consented and a request was created or updated), or
+#   3. A logged appointment request — any of the three Day-9 appointment
+#      specialists' (clinic, radiology, or pathology) book_appointment
+#      succeeded (see _AppointmentSpecialistBase.book_appointment, which
+#      records this onto the SAME main Assistant instance it was handed off
+#      from).
 #
 # Anything else is a FAILED call — not necessarily a bug, just a call that
 # didn't reach the above. See db.FAILURE_CATEGORIES for how failures are
@@ -193,7 +198,135 @@ Turn-Taking: End every turn with a single, clear question or prompt to keep the 
 Ending the Call (CRITICAL): Nothing else hangs up the call for the caller — you must actively end it yourself, every time, or the call just sits there. As soon as the caller says goodbye, thanks you and indicates they're done, or explicitly asks you to end the call or hang up, say a brief, warm farewell in the current conversation language (English: "Take care, goodbye!" / Hindi: "अपना ख्याल रखें, नमस्ते!") and THEN call end_call in that same turn. Never call end_call before saying goodbye, and never skip calling it once you've said goodbye — a farewell that isn't followed by end_call leaves the caller on a dead line.
 
 Handling Silence & Latency: If the caller is silent, gracefully prompt them once in the current conversation language — English: "Hello, can you hear me?" / Hindi: "नमस्ते, क्या आप मुझे सुन पा रहे हैं?". If there is still no response, say a brief goodbye and call end_call per the Ending the Call rule above rather than waiting indefinitely. Avoid filler words that might disrupt the speech-to-text processing pipeline.
+
+APPOINTMENT SPECIALISTS (Day 9 handoff)
+
+There are three separate specialists, each with exactly one job — booking, checking, rescheduling, or cancelling ONE specific kind of appointment. Route to whichever ONE actually matches what the caller needs:
+
+- transfer_to_clinic_specialist: a doctor/OPD consultation visit at a clinic, PHC, or hospital.
+- transfer_to_radiology_specialist: an imaging/scan appointment — X-ray, ultrasound, CT scan, MRI, mammogram, or similar.
+- transfer_to_pathology_specialist: a lab/diagnostic test appointment — blood test, urine test, biopsy sample collection, or similar (not imaging).
+
+If the caller isn't sure which kind they need (e.g. "the doctor asked me to get some tests done"), ask ONE brief clarifying question yourself first rather than guessing which specialist to route to. Keep handling plain "where is the nearest facility" questions yourself with find_nearby_health_facility — only hand off once it's genuinely about booking or managing one of these three kinds of appointment. Never hand off for symptoms, triage, scheme/eligibility questions, or anything needing human escalation — those stay with you. Before calling any of these tools, briefly tell the caller in your own words, in whichever language you're currently speaking, that you're connecting them to the relevant specialist.
 """
+
+
+# ---------------------------------------------------------------------------
+# Day 9 — Appointment Specialists
+#
+# Three separate, narrowly-scoped agents the main Assistant can hand off to
+# (see Assistant.transfer_to_clinic_specialist / _to_radiology_specialist /
+# _to_pathology_specialist below), one per kind of appointment: a clinic/OPD
+# visit, an imaging/radiology scan, or a pathology/lab test. Each does
+# exactly one job and nothing else — no symptom advice, no triage, no
+# scheme/eligibility answers, no human escalation, no interpreting results.
+# Anything outside its own scope goes straight back to the main Assistant
+# via transfer_back_to_main_assistant, per the APPOINTMENT SPECIALISTS
+# section of SYSTEM_PROMPT above. They share their plumbing (handoff/
+# hand-back bookkeeping, facility lookup, appointment CRUD) via
+# _AppointmentSpecialistBase below — only IDENTITY/SCOPE/GUARDRAILS differ
+# per specialist.
+# ---------------------------------------------------------------------------
+
+CLINIC_SPECIALIST_PROMPT = """
+IDENTITY
+
+You are the Clinic and Appointment Specialist, a focused assistant that HealthMitra (the main AI health assistant) hands callers off to for exactly one purpose: finding a clinic/hospital and booking, checking, rescheduling, or cancelling a DOCTOR/OPD CONSULTATION appointment there. You are still speaking with the same caller, in the same call — they were just connected to you mid-conversation, so never ask them to re-explain what they already told the main assistant; a short context note about what they need is included in your instructions when you take over.
+
+SCOPE (CRITICAL — stay narrow)
+
+You ONLY handle: finding a nearby clinic/hospital, and booking/checking/rescheduling/cancelling a doctor/OPD consultation appointment. You do NOT give symptom advice, triage guidance, medication guidance, scheme/eligibility answers, or handle human escalation, and you do NOT diagnose anything or name medications — you have no tools for any of that. If the caller actually needs an imaging/scan appointment (X-ray, ultrasound, CT, MRI) or a lab/blood test appointment rather than a doctor visit, call transfer_back_to_main_assistant so the main assistant can route them to the right specialist — do not try to book those yourself. The instant the caller asks about something else outside appointment/clinic logistics (symptoms, an emergency, a government scheme, wanting a human, or anything else), also call transfer_back_to_main_assistant immediately rather than attempting to help yourself, even partially. IMPORTANT: this means a NEW thing the caller says TO YOU after this handoff — the chat history you inherit may include an earlier topic (like symptoms) the caller already discussed with the main assistant BEFORE being connected to you; that was already handled and is NOT by itself a reason to hand back. Also call it once the caller's appointment need is fully handled and they have nothing more for you, or if they want to end the call — the main assistant is the one that actually says goodbye and hangs up.
+
+LANGUAGE
+
+Same rule as the main assistant: respond in whatever language the caller's most recent message was in (English or Hindi), re-checked every turn. When speaking Hindi, always use Devanagari script (देवनागरी लिपि), never Hinglish transliteration. Keep sentences short (1-2 sentences) — this is a phone call.
+
+TOOLS
+
+find_nearby_health_facility: use when the caller needs a clinic/hospital name or address before booking, or asks where to go. Reuse a district you already have (from the handoff context or an earlier lookup) rather than asking again if you already have it.
+
+book_appointment: use once you know which facility, and a preferred date (and time, if given) and a short reason (e.g. "follow-up visit", "new complaint"). This LOGS A REQUEST — it is not a live booking system and does not guarantee the facility can actually see them at that time. Always tell the caller honestly that this is a request that's been noted, give them the reference id, and that the facility/clinic still needs to confirm it — never say the appointment is "confirmed" or "booked" as if it were guaranteed.
+
+list_my_appointments: use if the caller asks about a clinic appointment they already requested, or wants to know what's on file for them.
+
+cancel_appointment: use if the caller wants to cancel a request — confirm which one first if they have more than one on file.
+
+GUARDRAILS
+
+Never invent a facility name, address, or appointment confirmation. If find_nearby_health_facility finds nothing, say so plainly and suggest the caller call the facility directly or ask their local ASHA worker — do not guess. Never claim to be a doctor or a human. If the caller describes a medical emergency or red-flag symptom, do not attempt to advise them yourself — call transfer_back_to_main_assistant immediately so the main assistant's safety-critical escalation script can run; don't delay this handoff by continuing the appointment conversation first.
+"""
+
+RADIOLOGY_SPECIALIST_PROMPT = """
+IDENTITY
+
+You are the Radiology Appointment Specialist, a focused assistant that HealthMitra (the main AI health assistant) hands callers off to for exactly one purpose: finding a facility and booking, checking, rescheduling, or cancelling an IMAGING/SCAN appointment there — X-ray, ultrasound, CT scan, MRI, mammogram, or similar. You are still speaking with the same caller, in the same call — they were just connected to you mid-conversation, so never ask them to re-explain what they already told the main assistant; a short context note about what they need is included in your instructions when you take over.
+
+SCOPE (CRITICAL — stay narrow)
+
+You ONLY handle: finding a nearby facility with imaging services, and booking/checking/rescheduling/cancelling an imaging/scan appointment. You do NOT give symptom advice, triage guidance, medication guidance, scheme/eligibility answers, or handle human escalation, and you do NOT diagnose anything, interpret or explain what a scan might show, or name medications — you have no tools for any of that and no way to actually see any results. If a caller asks what their scan result means, tell them plainly you can't interpret results and they should discuss it with their doctor, then continue with whatever booking task remains, or hand back if there's nothing else. If the caller actually needs a doctor/OPD consultation or a lab/blood test appointment rather than imaging, call transfer_back_to_main_assistant so the main assistant can route them to the right specialist — do not try to book those yourself. The instant the caller asks about something else outside appointment logistics (symptoms, an emergency, a government scheme, wanting a human, or anything else), also call transfer_back_to_main_assistant immediately rather than attempting to help yourself, even partially. IMPORTANT: this means a NEW thing the caller says TO YOU after this handoff — the chat history you inherit may include an earlier topic (like symptoms) the caller already discussed with the main assistant BEFORE being connected to you; that was already handled and is NOT by itself a reason to hand back. Also call it once the caller's appointment need is fully handled and they have nothing more for you, or if they want to end the call — the main assistant is the one that actually says goodbye and hangs up.
+
+LANGUAGE
+
+Same rule as the main assistant: respond in whatever language the caller's most recent message was in (English or Hindi), re-checked every turn. When speaking Hindi, always use Devanagari script (देवनागरी लिपि), never Hinglish transliteration. Keep sentences short (1-2 sentences) — this is a phone call.
+
+TOOLS
+
+find_nearby_health_facility: use when the caller needs a facility name or address before booking, or asks where to go for imaging. Reuse a district you already have (from the handoff context or an earlier lookup) rather than asking again if you already have it.
+
+book_appointment: use once you know which facility, which scan/imaging test is needed (pass it in `reason`, e.g. "chest X-ray", "abdominal ultrasound"), and a preferred date (and time, if given). This LOGS A REQUEST — it is not a live booking system and does not guarantee the facility can actually do the scan at that time. Always tell the caller honestly that this is a request that's been noted, give them the reference id, and that the facility still needs to confirm it — never say it is "confirmed" or "booked" as if guaranteed. Do not assert prep instructions (e.g. fasting) yourself — tell the caller the facility will confirm any preparation needed when they call to confirm.
+
+list_my_appointments: use if the caller asks about an imaging appointment they already requested, or wants to know what's on file for them.
+
+cancel_appointment: use if the caller wants to cancel a request — confirm which one first if they have more than one on file.
+
+GUARDRAILS
+
+Never invent a facility name, address, or appointment confirmation. If find_nearby_health_facility finds nothing, say so plainly and suggest the caller call the facility directly or ask their local ASHA worker — do not guess. Never claim to be a doctor, radiologist, or a human. If the caller describes a medical emergency or red-flag symptom, do not attempt to advise them yourself — call transfer_back_to_main_assistant immediately so the main assistant's safety-critical escalation script can run; don't delay this handoff by continuing the appointment conversation first.
+"""
+
+PATHOLOGY_SPECIALIST_PROMPT = """
+IDENTITY
+
+You are the Pathology and Lab Test Specialist, a focused assistant that HealthMitra (the main AI health assistant) hands callers off to for exactly one purpose: finding a facility and booking, checking, rescheduling, or cancelling a LAB/DIAGNOSTIC TEST appointment there — blood test, urine test, biopsy sample collection, or similar (not imaging). You are still speaking with the same caller, in the same call — they were just connected to you mid-conversation, so never ask them to re-explain what they already told the main assistant; a short context note about what they need is included in your instructions when you take over.
+
+SCOPE (CRITICAL — stay narrow)
+
+You ONLY handle: finding a nearby facility/lab, and booking/checking/rescheduling/cancelling a lab/diagnostic test appointment. You do NOT give symptom advice, triage guidance, medication guidance, scheme/eligibility answers, or handle human escalation, and you do NOT diagnose anything, interpret or explain what a test result might mean, or name medications — you have no tools for any of that and no way to actually see any results. If a caller asks what their test result means, tell them plainly you can't interpret results and they should discuss it with their doctor, then continue with whatever booking task remains, or hand back if there's nothing else. If the caller actually needs a doctor/OPD consultation or an imaging/scan appointment rather than a lab test, call transfer_back_to_main_assistant so the main assistant can route them to the right specialist — do not try to book those yourself. The instant the caller asks about something else outside appointment logistics (symptoms, an emergency, a government scheme, wanting a human, or anything else), also call transfer_back_to_main_assistant immediately rather than attempting to help yourself, even partially. IMPORTANT: this means a NEW thing the caller says TO YOU after this handoff — the chat history you inherit may include an earlier topic (like symptoms) the caller already discussed with the main assistant BEFORE being connected to you; that was already handled and is NOT by itself a reason to hand back. Also call it once the caller's appointment need is fully handled and they have nothing more for you, or if they want to end the call — the main assistant is the one that actually says goodbye and hangs up.
+
+LANGUAGE
+
+Same rule as the main assistant: respond in whatever language the caller's most recent message was in (English or Hindi), re-checked every turn. When speaking Hindi, always use Devanagari script (देवनागरी लिपि), never Hinglish transliteration. Keep sentences short (1-2 sentences) — this is a phone call.
+
+TOOLS
+
+find_nearby_health_facility: use when the caller needs a facility/lab name or address before booking, or asks where to go for a test. Reuse a district you already have (from the handoff context or an earlier lookup) rather than asking again if you already have it.
+
+book_appointment: use once you know which facility/lab, which test is needed (pass it in `reason`, e.g. "fasting blood sugar", "complete blood count"), and a preferred date (and time, if given). This LOGS A REQUEST — it is not a live booking system and does not guarantee the lab can actually do the test at that time. Always tell the caller honestly that this is a request that's been noted, give them the reference id, and that the facility still needs to confirm it — never say it is "confirmed" or "booked" as if guaranteed. Do not assert prep instructions (e.g. fasting requirements) yourself as medical fact — tell the caller the lab will confirm any preparation needed when they call to confirm.
+
+list_my_appointments: use if the caller asks about a lab test appointment they already requested, or wants to know what's on file for them.
+
+cancel_appointment: use if the caller wants to cancel a request — confirm which one first if they have more than one on file.
+
+GUARDRAILS
+
+Never invent a facility name, address, or appointment confirmation. If find_nearby_health_facility finds nothing, say so plainly and suggest the caller call the facility directly or ask their local ASHA worker — do not guess. Never claim to be a doctor, lab technician, or a human. If the caller describes a medical emergency or red-flag symptom, do not attempt to advise them yourself — call transfer_back_to_main_assistant immediately so the main assistant's safety-critical escalation script can run; don't delay this handoff by continuing the appointment conversation first.
+"""
+
+
+async def _publish_to_room(room: rtc.Room | None, topic: str, payload: dict) -> None:
+    """Best-effort push of a structured tool result to the caller's screen
+    (if a UI is attached to this room). Shared by Assistant and all
+    Day-9 appointment specialists. Never lets a UI publish failure interrupt
+    the voice call.
+    """
+    if room is None:
+        return
+    try:
+        await room.local_participant.send_text(
+            json.dumps(payload, ensure_ascii=False), topic=topic
+        )
+    except Exception:
+        logger.warning("Failed to publish %s data to room", topic, exc_info=True)
 
 
 class Assistant(Agent):
@@ -243,10 +376,44 @@ class Assistant(Agent):
         self.kb_hit = False
         self.escalation_success: dict | None = None
         self.escalation_consent_declined = False
+        # Day-9 call-outcome signal — set by ClinicAppointmentSpecialist.
+        # book_appointment on THIS SAME instance (it's handed the main agent,
+        # never a fresh one — see transfer_to_clinic_specialist) once a
+        # request is successfully logged. See CALL SUCCESS DEFINITION above.
+        self.appointment_booked: dict | None = None
         # Set True only if a function tool raises rather than returning a
         # normal result — see the function_tools_executed handler in
         # my_agent(), which is the only thing that ever sets this.
         self.tool_exception_occurred = False
+        # Day-9 handoff bookkeeping. This SAME Assistant instance is reused
+        # across a handoff to ClinicAppointmentSpecialist and back — never
+        # reconstructed — so all the state above survives the round trip.
+        # transfer_back_to_main_assistant() sets this True right before
+        # resuming this agent, so on_enter() below knows to continue the
+        # conversation naturally instead of either replaying the opening
+        # greeting or staying silent.
+        self._returning_from_specialist = False
+
+    async def on_enter(self) -> None:
+        # Only fires a reply here on the RETURN leg of a handoff — the very
+        # first on_enter (at call start) must stay a no-op, since my_agent()
+        # already drives the opening greeting itself (see GENERIC_OPENING_LEAD
+        # and the lookup_caller flow below), before the room is even connected.
+        if not self._returning_from_specialist:
+            return
+        self._returning_from_specialist = False
+        language_name = "HINDI" if self.current_language == "hi" else "ENGLISH"
+        self.session.generate_reply(
+            instructions=(
+                "The clinic and appointment specialist has just handed the "
+                "conversation back to you — either their part is done, or the "
+                f"caller asked about something outside appointments. The "
+                f"caller is CURRENTLY SPEAKING {language_name} — continue IN "
+                f"{language_name}. Do not re-greet them or ask them to repeat "
+                "anything already said. If there's nothing more pending, "
+                "briefly ask how else you can help."
+            )
+        )
 
     @function_tool
     async def lookup_caller(self, context: RunContext) -> str:
@@ -455,14 +622,7 @@ class Assistant(Agent):
         screen (if a UI is attached to this room). Never lets a UI publish
         failure interrupt the voice call.
         """
-        if self.room is None:
-            return
-        try:
-            await self.room.local_participant.send_text(
-                json.dumps(payload, ensure_ascii=False), topic=topic
-            )
-        except Exception:
-            logger.warning("Failed to publish %s data to room", topic, exc_info=True)
+        await _publish_to_room(self.room, topic, payload)
 
     @function_tool
     async def classify_symptom_triage(
@@ -734,6 +894,163 @@ class Assistant(Agent):
             "reply time."
         )
 
+    async def _start_appointment_specialist_handoff(
+        self,
+        specialist_cls: type["_AppointmentSpecialistBase"],
+        reason: str,
+    ) -> tuple[str, Agent] | str:
+        """Shared handoff logic for all three Day-9 appointment specialists
+        — construction, the failed-handoff fallback, and the deterministic
+        current-language directive (see the on_enter comment on
+        _AppointmentSpecialistBase for why that's spelled out explicitly
+        rather than left for the model to infer). Not itself a tool — each
+        transfer_to_*_specialist method below is the actual tool, with its
+        own docstring describing when the LLM should call it.
+        """
+        try:
+            specialist = specialist_cls(
+                main_agent=self,
+                chat_ctx=self.chat_ctx,
+                user_id=self.user_id,
+                room=self.room,
+                current_language=self.current_language,
+                handoff_reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to start %s handoff", specialist_cls.specialist_label
+            )
+            failure_language = "HINDI" if self.current_language == "hi" else "ENGLISH"
+            return (
+                f"TRANSFER FAILED — the {specialist_cls.specialist_label} could "
+                f"not be started right now. Apologize briefly IN {failure_language} "
+                "(the caller's current language) for the trouble, and keep "
+                "helping them yourself as best you can (e.g. "
+                "find_nearby_health_facility for a facility address, or "
+                "create_escalation if this genuinely needs a human). Do not "
+                "mention this as a technical error to the caller — just "
+                "smoothly continue helping."
+            )
+        language_name = "HINDI" if self.current_language == "hi" else "ENGLISH"
+        return (
+            "TRANSFERRING — if you haven't already said so this turn, tell "
+            "the caller now, briefly, that you're connecting them to the "
+            f"{specialist_cls.specialist_label}, IN {language_name} — that is "
+            "the language the caller is currently speaking with you, per the "
+            "conversation so far. Do not use the other language for this "
+            "line. The specialist is taking over from here and already "
+            f"knows why: {reason!r}.",
+            specialist,
+        )
+
+    @function_tool
+    async def transfer_to_clinic_specialist(
+        self, context: RunContext, reason: str
+    ) -> tuple[str, Agent] | str:
+        """Hand the conversation off to the Clinic and Appointment
+        Specialist — a separate agent whose only job is finding a clinic and
+        booking, checking, rescheduling, or cancelling a DOCTOR/OPD
+        CONSULTATION appointment there.
+
+        Call this when the caller wants to actually book/schedule a doctor
+        visit, or check/reschedule/cancel one they already requested. Do NOT
+        call this for an imaging/scan appointment (use
+        transfer_to_radiology_specialist) or a lab/blood test appointment
+        (use transfer_to_pathology_specialist). Do NOT call this just to
+        look up a nearby facility's name or address — keep using
+        find_nearby_health_facility yourself for that. Do NOT call this for
+        symptoms, triage, scheme/eligibility questions, or anything needing
+        human escalation — you handle those yourself, per your own
+        instructions.
+
+        Before calling this tool, tell the caller in your own words, in
+        whichever language you're currently speaking with them right now,
+        that you're connecting them to the clinic and appointment
+        specialist. Match their most recent message's language exactly —
+        do not switch languages for this line.
+
+        Args:
+            reason: A short note on what the caller needs (e.g. "wants to
+                book a follow-up appointment at Sassoon Hospital next
+                Tuesday"), passed to the specialist as context so the caller
+                doesn't have to repeat themselves.
+        """
+        return await self._start_appointment_specialist_handoff(
+            ClinicAppointmentSpecialist, reason
+        )
+
+    @function_tool
+    async def transfer_to_radiology_specialist(
+        self, context: RunContext, reason: str
+    ) -> tuple[str, Agent] | str:
+        """Hand the conversation off to the Radiology Appointment Specialist
+        — a separate agent whose only job is finding a facility and booking,
+        checking, rescheduling, or cancelling an IMAGING/SCAN appointment
+        there — X-ray, ultrasound, CT scan, MRI, mammogram, or similar.
+
+        Call this when the caller wants to actually book/schedule an
+        imaging/scan appointment, or check/reschedule/cancel one they
+        already requested. Do NOT call this for a doctor/OPD consultation
+        (use transfer_to_clinic_specialist) or a lab/blood test appointment
+        (use transfer_to_pathology_specialist). Do NOT call this just to
+        look up a nearby facility's name or address — keep using
+        find_nearby_health_facility yourself for that. Do NOT call this for
+        symptoms, triage, scheme/eligibility questions, or anything needing
+        human escalation — you handle those yourself, per your own
+        instructions.
+
+        Before calling this tool, tell the caller in your own words, in
+        whichever language you're currently speaking with them right now,
+        that you're connecting them to the radiology appointment specialist.
+        Match their most recent message's language exactly — do not switch
+        languages for this line.
+
+        Args:
+            reason: A short note on what the caller needs (e.g. "needs a
+                chest X-ray, doctor's referral in hand"), passed to the
+                specialist as context so the caller doesn't have to repeat
+                themselves.
+        """
+        return await self._start_appointment_specialist_handoff(
+            RadiologyAppointmentSpecialist, reason
+        )
+
+    @function_tool
+    async def transfer_to_pathology_specialist(
+        self, context: RunContext, reason: str
+    ) -> tuple[str, Agent] | str:
+        """Hand the conversation off to the Pathology and Lab Test
+        Specialist — a separate agent whose only job is finding a facility
+        and booking, checking, rescheduling, or cancelling a LAB/DIAGNOSTIC
+        TEST appointment there — blood test, urine test, biopsy sample
+        collection, or similar (not imaging).
+
+        Call this when the caller wants to actually book/schedule a lab
+        test appointment, or check/reschedule/cancel one they already
+        requested. Do NOT call this for a doctor/OPD consultation (use
+        transfer_to_clinic_specialist) or an imaging/scan appointment (use
+        transfer_to_radiology_specialist). Do NOT call this just to look up
+        a nearby facility's name or address — keep using
+        find_nearby_health_facility yourself for that. Do NOT call this for
+        symptoms, triage, scheme/eligibility questions, or anything needing
+        human escalation — you handle those yourself, per your own
+        instructions.
+
+        Before calling this tool, tell the caller in your own words, in
+        whichever language you're currently speaking with them right now,
+        that you're connecting them to the pathology and lab test
+        specialist. Match their most recent message's language exactly —
+        do not switch languages for this line.
+
+        Args:
+            reason: A short note on what the caller needs (e.g. "needs a
+                fasting blood sugar test"), passed to the specialist as
+                context so the caller doesn't have to repeat themselves.
+        """
+        return await self._start_appointment_specialist_handoff(
+            PathologyAppointmentSpecialist, reason
+        )
+
     # To add more tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
     # @function_tool
@@ -749,6 +1066,329 @@ class Assistant(Agent):
     #     logger.info(f"Looking up weather for {location}")
     #
     #     return "sunny with a temperature of 70 degrees."
+
+
+class _AppointmentSpecialistBase(Agent):
+    """Shared plumbing for the three Day-9 appointment specialists — handoff/
+    hand-back bookkeeping, facility lookup, and appointment request CRUD.
+    Subclasses (ClinicAppointmentSpecialist, RadiologyAppointmentSpecialist,
+    PathologyAppointmentSpecialist below) only supply their own narrow
+    IDENTITY/SCOPE/GUARDRAILS instructions plus two class attributes:
+
+    - appointment_type: one of db.APPOINTMENT_TYPES, stored on every
+      appointment this specialist books, and used to filter
+      list_my_appointments so one specialist doesn't surface another's
+      requests.
+    - specialist_label: human-readable name used in the main Assistant's
+      handoff messages and in this agent's own on_enter introduction.
+    """
+
+    appointment_type: str = "clinic"
+    specialist_label: str = "Appointment Specialist"
+
+    def __init__(
+        self,
+        *,
+        main_agent: Assistant,
+        chat_ctx: llm.ChatContext,
+        user_id: str | None,
+        room: rtc.Room | None,
+        current_language: str,
+        handoff_reason: str | None = None,
+        instructions: str,
+    ) -> None:
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
+        # A reference back to the SAME main-agent instance we were handed off
+        # from — never a freshly-constructed Assistant() — so transfer_back_
+        # to_main_assistant() resumes it with all its Day-4/7/8 state
+        # (user_id, escalation_ids, triage_results, kb_hit, ...) intact
+        # instead of losing it to a new object. See Assistant.__init__'s
+        # comment on _returning_from_specialist for the other half of this.
+        self._main_agent = main_agent
+        self.user_id = user_id
+        self.room = room
+        self.current_language = current_language
+        self._handoff_reason = handoff_reason
+
+    async def on_enter(self) -> None:
+        context_note = (
+            f" The ACTUAL, CURRENT reason you were handed off, per the main "
+            f"assistant's handoff note, is: {self._handoff_reason!r} — treat "
+            "THIS as the caller's live request right now."
+            if self._handoff_reason
+            else ""
+        )
+        # Deliberately no ready-made English/Hindi sentence here — an
+        # earlier version embedded literal example text for both languages
+        # and the model would sometimes just copy the Hindi one verbatim
+        # even in an all-English call (confirmed live, 2026-08-26). Stating
+        # the actual current language as a plain fact, instead of offering
+        # a template to pick from, is what fixed it.
+        #
+        # The "IMPORTANT" paragraph below fixes a second, separate bug
+        # (confirmed live, 2026-08-26): you inherit the FULL prior chat
+        # history, which can include an earlier, already-resolved topic
+        # (e.g. the caller got headache advice from the main assistant,
+        # THEN asked to book a lab test). Without this instruction, the
+        # model would see "headache" anywhere in that history and
+        # immediately invoke its own SCOPE guardrail ("hand back if the
+        # caller mentions symptoms") against that stale mention — bouncing
+        # straight back to the main assistant instead of doing the one job
+        # it was actually just handed off for, and then getting handed
+        # right back here again, in a loop.
+        language_name = "HINDI" if self.current_language == "hi" else "ENGLISH"
+        self.session.generate_reply(
+            instructions=(
+                "You have just taken over this call from the main assistant. "
+                f"The caller is CURRENTLY SPEAKING {language_name} — introduce "
+                f"yourself briefly IN {language_name} (Devanagari script if "
+                f"Hindi), as the {self.specialist_label}, per your own "
+                f"IDENTITY instructions.{context_note} Then continue "
+                "naturally from there — do NOT ask the caller to repeat "
+                "what they already told the main assistant, and do NOT "
+                "switch languages for this introduction.\n\nIMPORTANT: the "
+                "chat history you can see includes everything from BEFORE "
+                "this handoff too, possibly other topics (like symptoms) "
+                "the caller already discussed with the main assistant — "
+                "those were already handled and are NOT a reason to call "
+                "transfer_back_to_main_assistant right now. Only hand back "
+                "if the caller says something NEW to you, after this point, "
+                "that is actually outside your scope."
+            )
+        )
+
+    @function_tool
+    async def find_nearby_health_facility(
+        self, context: RunContext, district: str | None = None
+    ) -> str:
+        """Look up nearby government health facilities (hospitals/PHCs) for
+        a district — use this before booking if you don't yet know which
+        facility the caller wants an appointment at, or if they ask where
+        to go.
+
+        Reuse a district you already know — from the handoff context, or
+        the caller's saved profile — without asking again; only ask the
+        caller directly if you truly don't have it from any source yet.
+
+        Args:
+            district: The caller's district or city name. If omitted, this
+                tool tries the district saved on the caller's profile (from
+                an earlier call) before giving up.
+        """
+        resolved_district = district
+        used_saved_district = False
+        if not resolved_district and self.user_id:
+            caller = await asyncio.to_thread(db.get_caller, self.user_id)
+            if caller and caller["facts"].get("district"):
+                resolved_district = caller["facts"]["district"]
+                used_saved_district = True
+
+        result = await asyncio.to_thread(
+            health_tools.find_facilities, resolved_district or ""
+        )
+        await _publish_to_room(self.room, "healthmitra-facility", result)
+
+        if result["status"] == "no_district":
+            return (
+                "no_district — you don't have a district for this caller from "
+                "any source yet. Ask them which district or city they're in, "
+                "then call this tool again with that value."
+            )
+
+        if result["status"] == "not_found":
+            return (
+                f"not_found for district={resolved_district!r} as of "
+                f"{result['fetched_at']}. Tell the caller plainly that you "
+                "don't have facility information for their area — suggest "
+                "they call the facility directly or ask their local ASHA "
+                "worker. Do not invent a facility name or address."
+            )
+
+        facility_lines = "; ".join(
+            f"{f['name']} ({f['type']}, {f['area']})" for f in result["facilities"]
+        )
+        chain_note = (
+            " (district reused from this caller's saved profile — do not ask "
+            "them for it again)"
+            if used_saved_district
+            else ""
+        )
+        return (
+            f"district={resolved_district!r}{chain_note}, "
+            f"facilities=[{facility_lines}]. Speak this naturally in 1-2 "
+            "sentences, then ask which one they'd like to book an appointment "
+            "at (if that's why they're here)."
+        )
+
+    @function_tool
+    async def book_appointment(
+        self,
+        context: RunContext,
+        facility_name: str,
+        preferred_date: str,
+        preferred_time: str | None = None,
+        reason: str | None = None,
+    ) -> str:
+        """Log an appointment request for the caller at a specific facility.
+        This is NOT a live booking system — it records a request, it does
+        not guarantee the facility can see them at that time.
+
+        Args:
+            facility_name: The clinic/hospital/lab/imaging center name (e.g.
+                from find_nearby_health_facility, or one the caller already
+                named).
+            preferred_date: The date the caller wants, in their own words or
+                a normalized form (e.g. "next Tuesday", "2026-09-02").
+            preferred_time: The time the caller wants, if given (e.g.
+                "morning", "11am").
+            reason: What this appointment is for, e.g. "follow-up visit",
+                "chest X-ray", "fasting blood sugar test" — whichever
+                applies to what you handle. Never a long medical note.
+        """
+        district = None
+        if self.user_id:
+            caller = await asyncio.to_thread(db.get_caller, self.user_id)
+            if caller:
+                district = caller["facts"].get("district")
+
+        record = await asyncio.to_thread(
+            db.create_appointment,
+            user_id=self.user_id,
+            facility_name=facility_name,
+            district=district,
+            preferred_date=preferred_date,
+            preferred_time=preferred_time,
+            reason=reason,
+            appointment_type=self.appointment_type,
+        )
+        # Day-9 call-outcome signal — see CALL SUCCESS DEFINITION near the
+        # top of this file. Recorded on the MAIN agent instance (not self),
+        # since that's the object my_agent()'s close handler actually reads.
+        self._main_agent.appointment_booked = {
+            "facility": facility_name,
+            "appointment_id": record["id"],
+            "type": self.appointment_type,
+        }
+        return (
+            f"REQUESTED, reference_id={record['id']!r}, facility={facility_name!r}, "
+            f"date={preferred_date!r}, time={preferred_time!r}. Tell the caller "
+            "this reference id clearly, and be honest that this is a REQUEST "
+            "that's been noted, not a guaranteed confirmed slot — the facility "
+            "still needs to confirm it. Never say it is 'confirmed' or "
+            "'booked' as if guaranteed."
+        )
+
+    @function_tool
+    async def list_my_appointments(self, context: RunContext) -> str:
+        """List this caller's active (non-cancelled) appointment requests of
+        the kind you handle — use when they ask what they have on file, or
+        before cancelling one if they have more than one request.
+        """
+        if not self.user_id:
+            return "Could not look up appointments — caller not yet identified."
+        appointments = await asyncio.to_thread(
+            db.list_appointments_for_caller, self.user_id, self.appointment_type
+        )
+        if not appointments:
+            return "No active appointment requests on file for this caller."
+        lines = "; ".join(
+            f"id={a['id']}, facility={a['facility_name']!r}, "
+            f"date={a['preferred_date']!r}, time={a['preferred_time']!r}"
+            for a in appointments
+        )
+        return f"Active requests: {lines}. Read these out naturally, not as a raw list."
+
+    @function_tool
+    async def cancel_appointment(self, context: RunContext, appointment_id: str) -> str:
+        """Cancel one of the caller's appointment requests. If they have more
+        than one on file, confirm which one (by facility/date) before calling
+        this — use list_my_appointments first if you're not sure.
+
+        Args:
+            appointment_id: The reference id of the request to cancel.
+        """
+        record = await asyncio.to_thread(db.cancel_appointment, appointment_id)
+        if record is None:
+            return (
+                f"NOT_FOUND — no appointment request with id {appointment_id!r}. "
+                "Tell the caller you couldn't find that reference id, and "
+                "offer to look up their active requests instead."
+            )
+        return f"CANCELLED, reference_id={record['id']!r}. Confirm this to the caller."
+
+    @function_tool
+    async def transfer_back_to_main_assistant(
+        self, context: RunContext, reason: str
+    ) -> tuple[str, Agent]:
+        """Hand the conversation back to HealthMitra, the main assistant.
+
+        Call this as soon as: the caller's appointment need is fully handled
+        and they have nothing further for you, OR the caller needs a
+        DIFFERENT kind of appointment than the one you handle (the main
+        assistant will route them to the right specialist), OR the caller
+        asks about anything outside appointment logistics (symptoms, an
+        emergency, a scheme question, wanting a human, or anything else),
+        OR the caller wants to end the call (the main assistant is the one
+        that says goodbye and actually hangs up).
+
+        Args:
+            reason: A short note on why you're handing back (e.g. "booked
+                appointment, nothing further", "caller actually needs a lab
+                test, not imaging", or "caller asked about a scheme, outside
+                my scope"), passed to the main assistant.
+        """
+        await self._main_agent.update_chat_ctx(self.chat_ctx)
+        self._main_agent._returning_from_specialist = True
+        # Sync the language state back too — while this specialist was
+        # active, session.current_agent.current_language updates (see
+        # _on_user_input_transcribed in my_agent()) only touched THIS
+        # instance, not main_agent, so main_agent's copy would otherwise be
+        # stale if the caller switched languages mid-specialist.
+        self._main_agent.current_language = self.current_language
+        language_name = "HINDI" if self.current_language == "hi" else "ENGLISH"
+        return (
+            "RETURNING — if you haven't already said so this turn, tell the "
+            f"caller now, briefly, IN {language_name} (the caller's current "
+            "language), that you're connecting them back to the main "
+            f"assistant. Reason for the handback: {reason!r}.",
+            self._main_agent,
+        )
+
+
+class ClinicAppointmentSpecialist(_AppointmentSpecialistBase):
+    """Day 9 specialist — see the module comment above CLINIC_SPECIALIST_PROMPT
+    for what this agent is and isn't responsible for.
+    """
+
+    appointment_type = "clinic"
+    specialist_label = "Clinic and Appointment Specialist"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(instructions=CLINIC_SPECIALIST_PROMPT, **kwargs)
+
+
+class RadiologyAppointmentSpecialist(_AppointmentSpecialistBase):
+    """Day 9 specialist — see the module comment above RADIOLOGY_SPECIALIST_PROMPT
+    for what this agent is and isn't responsible for.
+    """
+
+    appointment_type = "radiology"
+    specialist_label = "Radiology Appointment Specialist"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(instructions=RADIOLOGY_SPECIALIST_PROMPT, **kwargs)
+
+
+class PathologyAppointmentSpecialist(_AppointmentSpecialistBase):
+    """Day 9 specialist — see the module comment above PATHOLOGY_SPECIALIST_PROMPT
+    for what this agent is and isn't responsible for.
+    """
+
+    appointment_type = "pathology"
+    specialist_label = "Pathology and Lab Test Specialist"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(instructions=PATHOLOGY_SPECIALIST_PROMPT, **kwargs)
 
 
 def resolve_caller_user_id(participant: rtc.RemoteParticipant) -> str:
@@ -867,6 +1507,7 @@ def _load_call_ending_config() -> dict:
             _CALL_ENDING_DEFAULTS,
         )
         return dict(_CALL_ENDING_DEFAULTS)
+
 
 # The exact strings SYSTEM_PROMPT's "Ending the Call" rule scripts, verbatim
 # reproduced by the model in both live tests above. "ख्याल" (not bare
@@ -1146,13 +1787,26 @@ async def my_agent(ctx: JobContext):
     # scripted farewell (see _looks_like_farewell); cleared the moment
     # anything else happens. None means "no farewell pending."
     farewell_spoken_at: float | None = None
+    # Day-9 handoff-loop visibility (confirmed live, 2026-08-26: a
+    # specialist's on_enter reply misread stale, already-resolved context —
+    # e.g. an earlier symptom discussion — as a fresh reason to bounce back
+    # to the main assistant, which then routed straight back to the same
+    # specialist, repeating indefinitely until the caller gave up and
+    # disconnected). The actual fix is prompt-level (see the "IMPORTANT" ...
+    # not a reason to hand back" text in _AppointmentSpecialistBase.on_enter
+    # and each specialist's SCOPE paragraph) — that's a prompt-only
+    # guarantee, so this counter is purely a logging backstop to make a
+    # recurrence immediately visible in the logs, not a behavioral fix.
+    handoffs_since_last_user_message = 0
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event):
         nonlocal user_message_count, last_activity_at, farewell_spoken_at
+        nonlocal handoffs_since_last_user_message
         last_activity_at = time.time()
         if event.item.role == "user":
             user_message_count += 1
+            handoffs_since_last_user_message = 0
         farewell_spoken_at = (
             last_activity_at
             if event.item.role == "assistant"
@@ -1166,6 +1820,16 @@ async def my_agent(ctx: JobContext):
             event.item.created_at,
         )
 
+    handoff_tool_names = frozenset(
+        {
+            "transfer_to_clinic_specialist",
+            "transfer_to_radiology_specialist",
+            "transfer_to_pathology_specialist",
+            "transfer_back_to_main_assistant",
+        }
+    )
+    handoff_loop_warning_threshold = 3
+
     @session.on("function_tools_executed")
     def _on_function_tools_executed(event):
         # A tool RAISING (as opposed to returning a normal — possibly
@@ -1176,6 +1840,18 @@ async def my_agent(ctx: JobContext):
             for output in event.function_call_outputs
         ):
             assistant.tool_exception_occurred = True
+
+        nonlocal handoffs_since_last_user_message
+        if any(call.name in handoff_tool_names for call in event.function_calls):
+            handoffs_since_last_user_message += 1
+            if handoffs_since_last_user_message == handoff_loop_warning_threshold:
+                logger.warning(
+                    "Possible Day-9 agent-handoff loop in room %s — %d "
+                    "specialist handoffs with no new caller message in "
+                    "between",
+                    ctx.room.name,
+                    handoffs_since_last_user_message,
+                )
 
     def _determine_call_outcome(close_event) -> tuple[str, str | None, str | None]:
         """The CALL SUCCESS DEFINITION, applied to what actually happened
@@ -1191,6 +1867,9 @@ async def my_agent(ctx: JobContext):
             return "success", None, f"escalation:{reason}:{urgency}"
         if assistant.kb_hit:
             return "success", None, "kb_answered"
+        if assistant.appointment_booked:
+            apt_type = assistant.appointment_booked.get("type", "clinic")
+            return "success", None, f"appointment_booked:{apt_type}"
 
         if assistant.tool_exception_occurred:
             return "failed", "tool_failure", None
@@ -1346,11 +2025,16 @@ async def my_agent(ctx: JobContext):
         target_locale = (
             "hi-IN" if str(event.language).lower().startswith("hi") else "en-IN"
         )
-        # Mirrored onto the Assistant instance regardless of whether the TTS
-        # locale actually switches below — end_call()'s fallback-farewell
-        # language should track the caller's most recent utterance exactly,
-        # not the (deliberately stickier) TTS-switch logic.
-        assistant.current_language = "hi" if target_locale == "hi-IN" else "en"
+        # Mirrored onto whichever agent is CURRENTLY ACTIVE (main assistant
+        # or, after a Day-9 handoff, the clinic specialist — both carry a
+        # current_language attribute) regardless of whether the TTS locale
+        # actually switches below — end_call()'s fallback-farewell language,
+        # and the specialist's on_enter introduction, should track the
+        # caller's most recent utterance exactly, not the (deliberately
+        # stickier) TTS-switch logic below, and not go stale after a handoff.
+        session.current_agent.current_language = (
+            "hi" if target_locale == "hi-IN" else "en"
+        )
         if target_locale != current_tts_locale and session.tts is not None:
             current_tts_locale = target_locale
             # update_options() is a Murf TTS extension, not part of the
