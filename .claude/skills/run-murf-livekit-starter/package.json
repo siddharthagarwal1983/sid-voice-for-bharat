@@ -1,0 +1,9 @@
+{
+  "name": "run-murf-livekit-starter-driver",
+  "private": true,
+  "type": "module",
+  "description": "Headless-browser driver for the run-murf-livekit-starter skill. Not part of the app itself.",
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}
